@@ -1,6 +1,7 @@
 from main import app
 from fastapi.testclient import TestClient
-from uuid import UUID
+from uuid import UUID, uuid4
+from datetime import datetime
 
 
 
@@ -39,6 +40,76 @@ def test_stripped_bad_description_returns_project_422():
         }
         
     response = client.post("/projects", json=payload)
-        
+
     assert response.status_code == 422
-    
+
+
+def create_test_project():
+    response = client.post("/projects", json={"description": "Test project"})
+    assert response.status_code == 201
+    return response.json()
+
+
+def test_get_project_returns_created_project():
+    created = create_test_project()
+
+    response = client.get(f"/projects/{created['id']}")
+
+    assert response.status_code == 200
+    assert response.json() == created
+
+
+def test_get_missing_project_returns_404():
+    response = client.get(f"/projects/{uuid4()}")
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Project not found"}
+
+
+def test_get_malformed_id_returns_422():
+    response = client.get("/projects/not-a-uuid")
+
+    assert response.status_code == 422
+
+
+def test_update_status_changes_status_and_updated_at():
+    created = create_test_project()
+
+    response = client.patch(f"/projects/{created['id']}/status", json={"status": "running"})
+    body = response.json()
+
+    assert response.status_code == 200
+    assert body["status"] == "running"
+    assert body["created_at"] == created["created_at"]
+    assert datetime.fromisoformat(body["updated_at"]) >= datetime.fromisoformat(created["updated_at"])
+
+
+def test_update_status_persists():
+    created = create_test_project()
+    client.patch(f"/projects/{created['id']}/status", json={"status": "completed"})
+
+    response = client.get(f"/projects/{created['id']}")
+
+    assert response.json()["status"] == "completed"
+
+
+def test_update_status_invalid_value_returns_422():
+    created = create_test_project()
+
+    response = client.patch(f"/projects/{created['id']}/status", json={"status": "banana"})
+
+    assert response.status_code == 422
+
+
+def test_update_status_missing_field_returns_422():
+    created = create_test_project()
+
+    response = client.patch(f"/projects/{created['id']}/status", json={})
+
+    assert response.status_code == 422
+
+
+def test_update_status_missing_project_returns_404():
+    response = client.patch(f"/projects/{uuid4()}/status", json={"status": "running"})
+
+    assert response.status_code == 404
