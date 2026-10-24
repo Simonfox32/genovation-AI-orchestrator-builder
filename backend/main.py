@@ -3,10 +3,13 @@ from enum import Enum
 from typing import Annotated
 from uuid import UUID, uuid4
 
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, StringConstraints
+from models import Project
 
-projects = {}  # Temporary in-memory storage: project id (UUID) -> project dict
+from sqlalchemy.orm import Session
+from fastapi import FastAPI, HTTPException, Depends
+from pydantic import BaseModel, StringConstraints
+from database import get_db
+
 app = FastAPI(title="AI Build Router API")
 
 
@@ -50,36 +53,37 @@ def health_check():
 
 
 @app.post("/projects", status_code=201, response_model=ProjectResponse)
-def create_project(project: ProjectCreate):
+def create_project(project: ProjectCreate, db : Session = Depends(get_db)):
     project_id = uuid4()
     now = datetime.now(timezone.utc)
 
-    new_project = {
-        "id": project_id,
-        "description": project.description,
-        "status": ProjectStatus.pending,
-        "created_at": now,
-        "updated_at": now,
-    }
+    new_project = Project(
+        id = project_id,
+        description = project.description,
+        status = "pending",
+        created_at = now,
+        updated_at = now
+    )
 
-    projects[project_id] = new_project
+    db.add(new_project)
+    db.commit()
     return new_project
 
 
 @app.get("/projects/{project_id}", response_model=ProjectResponse, responses=NOT_FOUND)
-def get_project(project_id: UUID):
-    project = projects.get(project_id)
+def get_project(project_id: UUID, db : Session = Depends(get_db)):
+    project = db.get(Project, project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="Project not found")
     return project
 
 
 @app.patch("/projects/{project_id}/status", response_model=ProjectResponse, responses=NOT_FOUND)
-def update_project_status(project_id: UUID, update: ProjectStatusUpdate):
-    project = projects.get(project_id)
+def update_project_status(project_id: UUID, update: ProjectStatusUpdate, db : Session = Depends(get_db)):
+    project = db.get(Project, project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="Project not found")
-
-    project["status"] = update.status
-    project["updated_at"] = datetime.now(timezone.utc)
+    project.status = update.status 
+    project.updated_at = datetime.now(timezone.utc)
+    db.commit()
     return project
