@@ -1,0 +1,49 @@
+
+{
+  "run_id": "demo-001",
+  "status": "running",
+  "summary": "Generating a task management application using multiple AI models.",
+  "tasks": [
+    {
+      "id": "task-1",
+      "name": "Analyze Requirements",
+      "model": "GPT",
+      "status": "completed",
+      "output": "Identified user authentication and task management requirements."
+    },
+    {
+      "id": "task-2",
+      "name": "Develop Frontend",
+      "model": "Claude",
+      "status": "completed",
+      "output": "Created React interface components."
+    },
+    {
+      "id": "task-3",
+      "name": "Develop Backend",
+      "model": "GPT",
+      "status": "running"
+    },
+    {
+      "id": "task-4",
+      "name": "Testing",
+      "model": "Gemini",
+      "status": "pending"
+    }
+  ],
+  "files": [
+    {
+      "path": "src/App.tsx",
+      "description": "Main React application",
+      "content": "export default function App() { return <h1>Task Manager</h1> }"
+    },
+    {
+      "path": "src/components/TaskList.tsx",
+      "description": "Task list component"
+    }
+  ],
+  "metrics": {
+    "duration_seconds": 18.4,
+    "tokens_used": 3400
+  }
+}
