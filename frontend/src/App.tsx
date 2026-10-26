@@ -1,23 +1,14 @@
 
 import { useState, type FormEvent } from 'react'
+import demoResponse from './data/demo-response.json'
 import './App.css'
 
-// 1. Define the JSON structure we send to the backend
-type ProjectRequest = {
-  prompt: string
-  preferences: {
-    preferred_model: string | null
-    optimization: string
-    include_tests: boolean
-  }
-}
-
-// 2. Define the JSON structure expected from the backend
+// Structure of the JSON results displayed by the frontend
 type Task = {
   id: string
   name: string
   model: string
-  status: 'pending' | 'running' | 'completed' | 'failed'
+  status: string
   output?: string
 }
 
@@ -27,7 +18,7 @@ type GeneratedFile = {
   content?: string
 }
 
-type BackendResult = {
+type OrchestrationResult = {
   run_id: string
   status: string
   summary?: string
@@ -39,61 +30,21 @@ type BackendResult = {
   }
 }
 
-// Backend location (configured later)
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || ''
-
-// Check whether the JSON has the expected basic structure
-function isBackendResult(data: unknown): data is BackendResult {
-  if (typeof data !== 'object' || data === null) {
-    return false
-  }
-
-  const value = data as Record<string, unknown>
-
-  return (
-    typeof value.run_id === 'string' &&
-    typeof value.status === 'string' &&
-    Array.isArray(value.tasks)
-  )
-}
-
-// Helper for retrieving JSON
-async function loadJson(
-  url: string,
-  options?: RequestInit
-): Promise<BackendResult> {
-  const response = await fetch(url, options)
-
-  if (!response.ok) {
-    throw new Error(`Request failed: ${response.status}`)
-  }
-
-  const json: unknown = await response.json()
-
-  if (!isBackendResult(json)) {
-    throw new Error('Unexpected backend JSON structure')
-  }
-
-  return json
-}
+// Sample JSON data loaded locally
+const sampleData: OrchestrationResult = demoResponse
 
 function App() {
-  // User inputs
+  // User input states
   const [prompt, setPrompt] = useState('')
   const [model, setModel] = useState('auto')
   const [optimization, setOptimization] = useState('balanced')
   const [includeTests, setIncludeTests] = useState(true)
 
-  // Data source: local JSON or real backend
-  const [mode, setMode] = useState<'demo' | 'backend'>('demo')
+  // Frontend display state
+  const [result, setResult] = useState<OrchestrationResult | null>(null)
 
-  // Data received from JSON
-  const [result, setResult] = useState<BackendResult | null>(null)
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState('')
-
-  // Convert form inputs into a JSON-compatible object
-  const requestData: ProjectRequest = {
+  // Organize user inputs into a JSON-compatible object
+  const requestData = {
     prompt: prompt.trim(),
     preferences: {
       preferred_model: model === 'auto' ? null : model,
@@ -102,71 +53,15 @@ function App() {
     }
   }
 
-  // Runs when Generate Project is clicked
-  async function handleGenerate(event: FormEvent<HTMLFormElement>) {
+  // Display local demo results when the button is clicked
+  function handleGenerate(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
 
-    setLoading(true)
-    setError('')
-    setResult(null)
-
-    try {
-      let data: BackendResult
-
-      if (mode === 'demo') {
-        // Read external JSON from the public folder
-        data = await loadJson('/demo-response.json', {
-          cache: 'no-store'
-        })
-      } else {
-        // Send user inputs to the real backend as JSON
-        data = await loadJson(`${API_BASE_URL}/api/orchestrate`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify(requestData)
-        })
-      }
-
-      setResult(data)
-    } catch (err) {
-      setError(
-        err instanceof Error ? err.message : 'Something went wrong'
-      )
-    } finally {
-      setLoading(false)
-    }
+    // No backend connection or API request
+    setResult(sampleData)
   }
 
-  // Reload the latest JSON data
-  async function handleRefresh() {
-    if (!result) return
-
-    setLoading(true)
-    setError('')
-
-    try {
-      const url =
-        mode === 'demo'
-          ? '/demo-response.json'
-          : `${API_BASE_URL}/api/runs/${encodeURIComponent(result.run_id)}`
-
-      const updatedData = await loadJson(url, {
-        cache: 'no-store'
-      })
-
-      setResult(updatedData)
-    } catch (err) {
-      setError(
-        err instanceof Error ? err.message : 'Refresh failed'
-      )
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  // Calculate progress from received tasks
+  // Calculate progress from the provided JSON
   const completedCount =
     result?.tasks.filter(task => task.status === 'completed').length ?? 0
 
@@ -185,7 +80,8 @@ function App() {
       </header>
 
       <main className="container">
-        {/* INPUT SECTION */}
+
+        {/* USER INPUT */}
         <section className="card">
           <h2>Create a Project</h2>
           <p>Describe what you want the AI to build.</p>
@@ -198,7 +94,10 @@ function App() {
               rows={5}
               placeholder="Build a task management application..."
               value={prompt}
-              onChange={e => setPrompt(e.target.value)}
+              onChange={e => {
+                setPrompt(e.target.value)
+                setResult(null)
+              }}
             />
 
             <label htmlFor="model">Preferred AI Model</label>
@@ -214,7 +113,9 @@ function App() {
               <option value="gemini">Gemini</option>
             </select>
 
-            <label htmlFor="optimization">Optimization</label>
+            <label htmlFor="optimization">
+              Optimization Preference
+            </label>
 
             <select
               id="optimization"
@@ -235,69 +136,47 @@ function App() {
               Include automated tests
             </label>
 
-            <label htmlFor="mode">Data Source</label>
-
-            <select
-              id="mode"
-              value={mode}
-              onChange={e => {
-                setMode(e.target.value as 'demo' | 'backend')
-                setResult(null)
-                setError('')
-              }}
-            >
-              <option value="demo">Local JSON (Demo)</option>
-              <option value="backend">Backend API</option>
-            </select>
-
             <button
               className="generate-btn"
               type="submit"
-              disabled={!prompt.trim() || loading}
+              disabled={!prompt.trim()}
             >
-              {loading ? 'Loading...' : 'Generate Project'}
+              Generate Project (Demo)
             </button>
           </form>
 
-          {/* Show the JSON that would be sent */}
+          {/* Preview of JSON input */}
           <details className="json-section">
-            <summary>Preview JSON Request</summary>
+            <summary>View Input JSON</summary>
             <pre className="json-box">
               {JSON.stringify(requestData, null, 2)}
             </pre>
           </details>
         </section>
 
-        {/* ERROR SECTION */}
-        {error && (
-          <div className="error-message">
-            <strong>Error:</strong> {error}
-          </div>
-        )}
-
-        {/* RESULTS SECTION */}
+        {/* RESULTS FROM LOCAL JSON */}
         {result && (
           <section className="card results">
-            <div className="results-header">
-              <h2>Orchestration Dashboard</h2>
+            <h2>Orchestration Dashboard</h2>
+            <p className="demo-label">
+              Sample results — frontend demonstration only
+            </p>
 
-              <button
-                className="refresh-btn"
-                type="button"
-                onClick={handleRefresh}
-                disabled={loading}
-              >
-                {loading ? 'Refreshing...' : 'Refresh JSON'}
-              </button>
-            </div>
+            <p>
+              <strong>Run ID:</strong> {result.run_id}
+            </p>
 
-            <p><strong>Run ID:</strong> {result.run_id}</p>
-            <p><strong>Overall Status:</strong> {result.status}</p>
+            <p>
+              <strong>Overall Status:</strong> {result.status}
+            </p>
 
             {result.summary && (
-              <p><strong>Summary:</strong> {result.summary}</p>
+              <p>
+                <strong>Summary:</strong> {result.summary}
+              </p>
             )}
 
+            {/* PROGRESS */}
             <h3>Task Progress</h3>
 
             <div className="progress-bar">
@@ -311,12 +190,15 @@ function App() {
               {completedCount} of {totalTasks} tasks completed ({progress}%)
             </p>
 
-            {/* Dynamically display every task from JSON */}
+            {/* TASKS */}
+            <h3>Assigned Tasks</h3>
+
             <div className="task-list">
               {result.tasks.map(task => (
                 <div className="task" key={task.id}>
                   <div>
                     <strong>{task.name}</strong>
+
                     <p>Assigned AI: {task.model || 'Unassigned'}</p>
 
                     {task.output && (
@@ -324,7 +206,14 @@ function App() {
                     )}
                   </div>
 
-                  <span className={`status ${task.status}`}>
+                  <span
+                    className={`status ${
+                      ['pending', 'running', 'completed', 'failed']
+                        .includes(task.status)
+                        ? task.status
+                        : 'pending'
+                    }`}
+                  >
                     {task.status}
                   </span>
                 </div>
@@ -332,10 +221,10 @@ function App() {
             </div>
 
             {result.tasks.length === 0 && (
-              <p>No tasks have been returned yet.</p>
+              <p>No tasks available.</p>
             )}
 
-            {/* Generated files from backend */}
+            {/* GENERATED FILES */}
             <h3>Generated Files</h3>
 
             {result.files && result.files.length > 0 ? (
@@ -344,19 +233,23 @@ function App() {
                   <details key={file.path}>
                     <summary>{file.path}</summary>
 
-                    {file.description && <p>{file.description}</p>}
+                    {file.description && (
+                      <p>{file.description}</p>
+                    )}
 
                     {file.content && (
-                      <pre className="json-box">{file.content}</pre>
+                      <pre className="json-box">
+                        {file.content}
+                      </pre>
                     )}
                   </details>
                 ))}
               </div>
             ) : (
-              <p>No generated files available yet.</p>
+              <p>No generated files available.</p>
             )}
 
-            {/* Optional execution metrics */}
+            {/* EXECUTION DETAILS */}
             {result.metrics && (
               <>
                 <h3>Execution Details</h3>
@@ -377,9 +270,9 @@ function App() {
               </>
             )}
 
-            {/* Raw backend response for debugging */}
+            {/* RAW JSON DISPLAY */}
             <details className="json-section">
-              <summary>View Raw Backend JSON</summary>
+              <summary>View Results JSON</summary>
               <pre className="json-box">
                 {JSON.stringify(result, null, 2)}
               </pre>
