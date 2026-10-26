@@ -33,7 +33,7 @@ Not deployed yet (Railway/Supabase is next).
 
 You need:
 
-- **Python** 3.12 or newer (developed on 3.14)
+- **Python** 3.12 or newer (developed on 3.14) — check `python3 --version`; macOS's built-in `/usr/bin/python3` is 3.9 and too old (see [backend/README.md](backend/README.md#prerequisites))
 - **PostgreSQL** running locally (developed on 17)
 - **Node.js** 20.19+ or 22.12+ (developed on 24) — older versions can't run the frontend's build tool
 

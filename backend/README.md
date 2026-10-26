@@ -6,7 +6,7 @@ For running the whole stack (database + backend + frontend), see the [root READM
 
 ## Prerequisites
 
-- Python 3.12 or newer (developed on 3.14)
+- Python 3.12 or newer (developed on 3.14). **Check with `python3 --version` before creating the virtual environment.** On macOS, the built-in `/usr/bin/python3` is 3.9, which is too old; install a newer one (`brew install python`) and, if `python3` still reports 3.9, create the environment with the full path instead, e.g. `/opt/homebrew/bin/python3 -m venv .venv`.
 - PostgreSQL running locally (developed on 17)
 - Git
 
@@ -194,6 +194,7 @@ Tests use `TEST_DATABASE_URL` and recreate the tables before every test, so they
 | Problem | Fix |
 |---|---|
 | Only `README.md` in the repo | You're on `main` — run `git switch dev` |
+| `No matching distribution found for sqlalchemy<3,>=2.1` | Your virtual environment uses Python older than 3.11. Delete `.venv` and recreate it with a newer Python (see Prerequisites) |
 | `command not found: uvicorn` / `pytest` / `alembic` | Activate the virtual environment |
 | `ModuleNotFoundError: No module named 'main'` | Run commands from inside `backend/` |
 | `KeyError: 'DATABASE_URL'` | Create `.env` from `.env.example` |
