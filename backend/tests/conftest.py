@@ -5,11 +5,14 @@ from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from database import get_db
+from database import get_db, get_session_factory
 from main import app
 from models import Base
+from orchestration import get_pipeline
 
 load_dotenv()
+
+os.environ["DEMO_STEP_DELAY_SECONDS"] = "0"  # No artificial delay in tests
 
 TEST_DATABASE_URL = os.environ["TEST_DATABASE_URL"]
 
@@ -30,8 +33,18 @@ def override_get_db():
         db.close()
 
 
-# Every request made through TestClient now gets a test-database session instead of a dev one.
+# Every request made through TestClient now gets a test-database session instead of a dev one,
+# and the background pipeline opens its sessions on the test database too.
 app.dependency_overrides[get_db] = override_get_db
+app.dependency_overrides[get_session_factory] = lambda: TestSessionLocal
+
+
+@pytest.fixture
+def no_pipeline():
+    """For tests about the API itself: create projects without running the background pipeline."""
+    app.dependency_overrides[get_pipeline] = lambda: (lambda project_id, session_factory: None)
+    yield
+    app.dependency_overrides.pop(get_pipeline, None)
 
 
 @pytest.fixture(autouse=True)

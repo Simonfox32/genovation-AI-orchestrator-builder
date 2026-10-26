@@ -19,3 +19,11 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+def get_session_factory():
+    """Give background work a way to open its own sessions after the request's session is closed.
+
+    A dependency (rather than importing SessionLocal directly) so tests can point it at the test database.
+    """
+    return SessionLocal

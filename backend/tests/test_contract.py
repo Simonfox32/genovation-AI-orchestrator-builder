@@ -41,7 +41,7 @@ def test_new_project_has_no_summary_and_no_tasks():
     assert created["tasks"] == []
 
 
-def test_get_returns_tasks_in_position_order(db_session):
+def test_get_returns_tasks_in_position_order(db_session, no_pipeline):
     created = create_project()
     project_id = UUID(created["id"])
     # TEST DATA: inserted directly, out of order, to check the API sorts by position.

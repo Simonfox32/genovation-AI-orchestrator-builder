@@ -51,7 +51,7 @@ def create_test_project():
     return response.json()
 
 
-def test_get_project_returns_created_project():
+def test_get_project_returns_created_project(no_pipeline):
     created = create_test_project()
 
     response = client.get(f"/projects/{created['id']}")
@@ -116,7 +116,7 @@ def test_update_status_missing_project_returns_404():
     assert response.status_code == 404
 
 
-def test_created_project_is_stored_in_database(db_session):
+def test_created_project_is_stored_in_database(db_session, no_pipeline):
     response = client.post("/projects", json={"description": "  Persist me  "})
     project_id = UUID(response.json()["id"])
 

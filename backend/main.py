@@ -7,10 +7,11 @@ from uuid import UUID, uuid4
 from models import Project
 
 from sqlalchemy.orm import Session
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import AfterValidator, BaseModel, StringConstraints
-from database import get_db
+from database import get_db, get_session_factory
+from orchestration import get_pipeline
 
 app = FastAPI(title="AI Build Router API")
 
@@ -102,7 +103,13 @@ def health_check():
 
 
 @app.post("/projects", status_code=201, response_model=ProjectResponse)
-def create_project(project: ProjectCreate, db : Session = Depends(get_db)):
+def create_project(
+    project: ProjectCreate,
+    background_tasks: BackgroundTasks,
+    db : Session = Depends(get_db),
+    session_factory = Depends(get_session_factory),
+    pipeline = Depends(get_pipeline),
+):
     project_id = uuid4()
     now = datetime.now(timezone.utc)
 
@@ -117,6 +124,9 @@ def create_project(project: ProjectCreate, db : Session = Depends(get_db)):
 
     db.add(new_project)
     db.commit()
+
+    # Runs after the 201 response is sent, so the client gets the id immediately and polls GET for progress.
+    background_tasks.add_task(pipeline, new_project.id, session_factory)
     return new_project
 
 
