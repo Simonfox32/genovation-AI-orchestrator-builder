@@ -1,34 +1,51 @@
-
 {
-  "run_id": "demo-001",
+  "id": "demo-001",
+  "description": "Build a task management application",
   "status": "running",
-  "summary": "Generating a task management application using multiple AI models.",
+  "optimization": "balanced",
+  "summary": "DEMO DATA (not from the backend): generating a task management application using multiple AI models.",
+  "created_at": "2026-10-25T18:00:00Z",
+  "updated_at": "2026-10-25T18:00:18Z",
   "tasks": [
     {
       "id": "task-1",
+      "position": 1,
       "name": "Analyze Requirements",
-      "model": "GPT",
+      "description": null,
+      "tool": "GPT",
       "status": "completed",
+      "attempts": 1,
       "output": "Identified user authentication and task management requirements."
     },
     {
       "id": "task-2",
+      "position": 2,
       "name": "Develop Frontend",
-      "model": "Claude",
+      "description": null,
+      "tool": "Claude",
       "status": "completed",
+      "attempts": 2,
       "output": "Created React interface components."
     },
     {
       "id": "task-3",
+      "position": 3,
       "name": "Develop Backend",
-      "model": "GPT",
-      "status": "running"
+      "description": null,
+      "tool": "GPT",
+      "status": "running",
+      "attempts": 1,
+      "output": null
     },
     {
       "id": "task-4",
+      "position": 4,
       "name": "Testing",
-      "model": "Gemini",
-      "status": "pending"
+      "description": null,
+      "tool": null,
+      "status": "pending",
+      "attempts": 0,
+      "output": null
     }
   ],
   "files": [

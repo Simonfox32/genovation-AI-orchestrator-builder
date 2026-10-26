@@ -1,26 +1,30 @@
 
-import { useState, type FormEvent } from 'react'
+import { useEffect, useState, type FormEvent } from 'react'
 import './App.css'
 
-// 1. Define the JSON structure we send to the backend
+// 1. Define the JSON structure we send to the backend (POST /projects)
+type Optimization = 'balanced' | 'speed' | 'quality'
+
 type ProjectRequest = {
-  prompt: string
-  preferences: {
-    preferred_model: string | null
-    optimization: string
-    include_tests: boolean
-  }
+  description: string
+  optimization: Optimization
 }
 
-// 2. Define the JSON structure expected from the backend
+// 2. Define the JSON structure expected from the backend (GET /projects/{id})
+type Status = 'pending' | 'running' | 'completed' | 'failed'
+
 type Task = {
   id: string
+  position: number
   name: string
-  model: string
-  status: 'pending' | 'running' | 'completed' | 'failed'
-  output?: string
+  description: string | null
+  tool: string | null
+  status: Status
+  attempts: number
+  output: string | null
 }
 
+// Not produced by the backend yet; kept so the UI is ready when they are added
 type GeneratedFile = {
   path: string
   description?: string
@@ -28,9 +32,13 @@ type GeneratedFile = {
 }
 
 type BackendResult = {
-  run_id: string
-  status: string
-  summary?: string
+  id: string
+  description: string
+  status: Status
+  optimization: Optimization
+  summary: string | null
+  created_at: string
+  updated_at: string
   tasks: Task[]
   files?: GeneratedFile[]
   metrics?: {
@@ -39,8 +47,15 @@ type BackendResult = {
   }
 }
 
-// Backend location (configured later)
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || ''
+// Backend location: set VITE_API_BASE_URL in frontend/.env.local; defaults to the local backend
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
+
+// How often to re-check a project that is still being processed
+const POLL_INTERVAL_MS = 2000
+
+function isInProgress(status: string): boolean {
+  return status === 'pending' || status === 'running'
+}
 
 // Check whether the JSON has the expected basic structure
 function isBackendResult(data: unknown): data is BackendResult {
@@ -51,10 +66,41 @@ function isBackendResult(data: unknown): data is BackendResult {
   const value = data as Record<string, unknown>
 
   return (
-    typeof value.run_id === 'string' &&
+    typeof value.id === 'string' &&
     typeof value.status === 'string' &&
     Array.isArray(value.tasks)
   )
+}
+
+// Turn one FastAPI validation error ({loc, msg}) into "field: message"
+function describeValidationError(item: unknown): string {
+  if (typeof item !== 'object' || item === null) {
+    return String(item)
+  }
+
+  const { loc, msg } = item as { loc?: unknown[]; msg?: string }
+  const field = Array.isArray(loc) ? loc[loc.length - 1] : undefined
+
+  return field ? `${String(field)}: ${msg}` : msg ?? 'Invalid request'
+}
+
+// Use the backend's own error message ("detail") when there is one
+async function errorMessage(response: Response): Promise<string> {
+  try {
+    const body = (await response.json()) as { detail?: unknown }
+
+    if (typeof body.detail === 'string') {
+      return body.detail
+    }
+
+    if (Array.isArray(body.detail)) {
+      return body.detail.map(describeValidationError).join('; ')
+    }
+  } catch {
+    // Response body was not JSON; fall through to the generic message
+  }
+
+  return `Request failed: ${response.status}`
 }
 
 // Helper for retrieving JSON
@@ -62,10 +108,17 @@ async function loadJson(
   url: string,
   options?: RequestInit
 ): Promise<BackendResult> {
-  const response = await fetch(url, options)
+  let response: Response
+
+  try {
+    response = await fetch(url, options)
+  } catch {
+    // fetch only throws when no response arrived at all (server down, wrong URL, or CORS)
+    throw new Error(`Could not reach ${url}. Is the backend running?`)
+  }
 
   if (!response.ok) {
-    throw new Error(`Request failed: ${response.status}`)
+    throw new Error(await errorMessage(response))
   }
 
   const json: unknown = await response.json()
@@ -77,12 +130,15 @@ async function loadJson(
   return json
 }
 
+function projectUrl(id: string): string {
+  return `${API_BASE_URL}/projects/${encodeURIComponent(id)}`
+}
+
 function App() {
   // User inputs
+  // (Preferred model and "include tests" controls are hidden until the orchestrator uses them)
   const [prompt, setPrompt] = useState('')
-  const [model, setModel] = useState('auto')
-  const [optimization, setOptimization] = useState('balanced')
-  const [includeTests, setIncludeTests] = useState(true)
+  const [optimization, setOptimization] = useState<Optimization>('balanced')
 
   // Data source: local JSON or real backend
   const [mode, setMode] = useState<'demo' | 'backend'>('demo')
@@ -94,13 +150,39 @@ function App() {
 
   // Convert form inputs into a JSON-compatible object
   const requestData: ProjectRequest = {
-    prompt: prompt.trim(),
-    preferences: {
-      preferred_model: model === 'auto' ? null : model,
-      optimization: optimization,
-      include_tests: includeTests
-    }
+    description: prompt.trim(),
+    optimization: optimization
   }
+
+  // While the backend is still processing, re-fetch the project every few seconds
+  useEffect(() => {
+    if (mode !== 'backend' || !result || !isInProgress(result.status)) {
+      return
+    }
+
+    let cancelled = false
+
+    const timer = setTimeout(async () => {
+      try {
+        const updatedData = await loadJson(projectUrl(result.id), {
+          cache: 'no-store'
+        })
+
+        if (!cancelled) {
+          setResult(updatedData)
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setError(err instanceof Error ? err.message : 'Refresh failed')
+        }
+      }
+    }, POLL_INTERVAL_MS)
+
+    return () => {
+      cancelled = true
+      clearTimeout(timer)
+    }
+  }, [mode, result])
 
   // Runs when Generate Project is clicked
   async function handleGenerate(event: FormEvent<HTMLFormElement>) {
@@ -119,8 +201,9 @@ function App() {
           cache: 'no-store'
         })
       } else {
-        // Send user inputs to the real backend as JSON
-        data = await loadJson(`${API_BASE_URL}/api/orchestrate`, {
+        // Send user inputs to the real backend as JSON.
+        // The backend replies immediately with a "pending" project; polling picks up progress.
+        data = await loadJson(`${API_BASE_URL}/projects`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json'
@@ -148,9 +231,7 @@ function App() {
 
     try {
       const url =
-        mode === 'demo'
-          ? '/demo-response.json'
-          : `${API_BASE_URL}/api/runs/${encodeURIComponent(result.run_id)}`
+        mode === 'demo' ? '/demo-response.json' : projectUrl(result.id)
 
       const updatedData = await loadJson(url, {
         cache: 'no-store'
@@ -170,12 +251,18 @@ function App() {
   const completedCount =
     result?.tasks.filter(task => task.status === 'completed').length ?? 0
 
+  const finishedCount =
+    result?.tasks.filter(task => !isInProgress(task.status)).length ?? 0
+
   const totalTasks = result?.tasks.length ?? 0
 
   const progress =
     totalTasks > 0
-      ? Math.round((completedCount / totalTasks) * 100)
+      ? Math.round((finishedCount / totalTasks) * 100)
       : 0
+
+  const polling =
+    mode === 'backend' && result !== null && isInProgress(result.status)
 
   return (
     <div className="app">
@@ -201,39 +288,17 @@ function App() {
               onChange={e => setPrompt(e.target.value)}
             />
 
-            <label htmlFor="model">Preferred AI Model</label>
-
-            <select
-              id="model"
-              value={model}
-              onChange={e => setModel(e.target.value)}
-            >
-              <option value="auto">Automatic Selection</option>
-              <option value="gpt">GPT</option>
-              <option value="claude">Claude</option>
-              <option value="gemini">Gemini</option>
-            </select>
-
             <label htmlFor="optimization">Optimization</label>
 
             <select
               id="optimization"
               value={optimization}
-              onChange={e => setOptimization(e.target.value)}
+              onChange={e => setOptimization(e.target.value as Optimization)}
             >
               <option value="balanced">Balanced</option>
               <option value="speed">Fastest</option>
               <option value="quality">Best Quality</option>
             </select>
-
-            <label className="checkbox-row">
-              <input
-                type="checkbox"
-                checked={includeTests}
-                onChange={e => setIncludeTests(e.target.checked)}
-              />
-              Include automated tests
-            </label>
 
             <label htmlFor="mode">Data Source</label>
 
@@ -287,12 +352,16 @@ function App() {
                 onClick={handleRefresh}
                 disabled={loading}
               >
-                {loading ? 'Refreshing...' : 'Refresh JSON'}
+                {loading ? 'Refreshing...' : 'Refresh'}
               </button>
             </div>
 
-            <p><strong>Run ID:</strong> {result.run_id}</p>
-            <p><strong>Overall Status:</strong> {result.status}</p>
+            <p><strong>Project ID:</strong> {result.id}</p>
+            <p>
+              <strong>Overall Status:</strong> {result.status}
+              {polling && ' (updating automatically...)'}
+            </p>
+            <p><strong>Optimization:</strong> {result.optimization}</p>
 
             {result.summary && (
               <p><strong>Summary:</strong> {result.summary}</p>
@@ -308,7 +377,7 @@ function App() {
             </div>
 
             <p>
-              {completedCount} of {totalTasks} tasks completed ({progress}%)
+              {finishedCount} of {totalTasks} tasks finished, {completedCount} completed ({progress}%)
             </p>
 
             {/* Dynamically display every task from JSON */}
@@ -316,11 +385,16 @@ function App() {
               {result.tasks.map(task => (
                 <div className="task" key={task.id}>
                   <div>
-                    <strong>{task.name}</strong>
-                    <p>Assigned AI: {task.model || 'Unassigned'}</p>
+                    <strong>{task.position}. {task.name}</strong>
+
+                    {task.description && <p>{task.description}</p>}
+
+                    <p>
+                      Tool: {task.tool ?? (task.status === 'failed' ? 'none passed' : 'Unassigned')} · Attempts: {task.attempts}
+                    </p>
 
                     {task.output && (
-                      <p>Output: {task.output}</p>
+                      <pre className="json-box">{task.output}</pre>
                     )}
                   </div>
 
