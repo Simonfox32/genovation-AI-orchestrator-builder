@@ -1,4 +1,5 @@
 from main import app
+from models import Project
 from fastapi.testclient import TestClient
 from uuid import UUID, uuid4
 from datetime import datetime
@@ -113,3 +114,16 @@ def test_update_status_missing_project_returns_404():
     response = client.patch(f"/projects/{uuid4()}/status", json={"status": "running"})
 
     assert response.status_code == 404
+
+
+def test_created_project_is_stored_in_database(db_session):
+    response = client.post("/projects", json={"description": "  Persist me  "})
+    project_id = UUID(response.json()["id"])
+
+    # Read the row straight from Postgres with a separate session, bypassing the API.
+    stored = db_session.get(Project, project_id)
+
+    assert stored is not None
+    assert stored.description == "Persist me"
+    assert stored.status == "pending"
+    assert stored.created_at == stored.updated_at
