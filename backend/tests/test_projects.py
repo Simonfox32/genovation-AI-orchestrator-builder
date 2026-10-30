@@ -184,3 +184,15 @@ def test_update_status_malformed_id_returns_422():
         json={"status": "running"},
     )
     assert response.status_code == 422
+
+def test_description_length_5000_returns_201():
+    sample_string = "f" * 5000
+    response = client.post("/projects", json={"description": f"{sample_string}"})
+    assert response.status_code == 201
+
+def test_description_length_5001_returns_422():
+    sample_string = "f" * 5001
+    response = client.post("/projects", json={"description": sample_string})
+    assert response.status_code == 422
+    
+    

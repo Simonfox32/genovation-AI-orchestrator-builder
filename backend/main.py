@@ -56,7 +56,7 @@ UTCDatetime = Annotated[datetime, AfterValidator(lambda dt: dt.astimezone(timezo
 
 # What the client may send when creating a project.
 class ProjectCreate(BaseModel):
-    description: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+    description: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=5000)]
     optimization: Optimization = Optimization.balanced
 
 
