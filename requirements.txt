@@ -1,0 +1,2 @@
+# Railway builds from the repo root; this points it at the backend's real dependency list.
+-r backend/requirements.txt

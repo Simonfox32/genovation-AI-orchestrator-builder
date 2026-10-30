@@ -8,7 +8,9 @@ load_dotenv()  # Reads backend/.env into environment variables (no-op if the fil
 
 DATABASE_URL = os.environ["DATABASE_URL"]  # Crash at startup if missing, rather than on the first request
 
-engine = create_engine(DATABASE_URL)
+# Creates DB connection, if connection is closed, new connection will be created 
+
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine)
 
 
