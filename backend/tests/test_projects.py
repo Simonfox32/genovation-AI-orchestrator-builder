@@ -133,7 +133,7 @@ def test_missing_description_returns_422():
 
     assert response.status_code == 422
 
-def test_invalid_status_does_not_change_project():
+def test_invalid_status_does_not_change_project(no_pipeline):
     created = create_test_project()
     project_id = created["id"]
 
@@ -149,7 +149,7 @@ def test_invalid_status_does_not_change_project():
     assert saved.status_code == 200
     assert saved.json() == created
 
-def test_updating_one_project_does_not_change_another():
+def test_updating_one_project_does_not_change_another(no_pipeline):
     first = create_test_project()
     second = create_test_project()
 
