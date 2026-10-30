@@ -127,3 +127,60 @@ def test_created_project_is_stored_in_database(db_session, no_pipeline):
     assert stored.description == "Persist me"
     assert stored.status == "pending"
     assert stored.created_at == stored.updated_at
+
+def test_missing_description_returns_422():
+    response = client.post("/projects", json={})
+
+    assert response.status_code == 422
+
+def test_invalid_status_does_not_change_project():
+    created = create_test_project()
+    project_id = created["id"]
+
+    response = client.patch(
+        f"/projects/{project_id}/status",
+        json={"status": "banana"},
+    )
+
+    assert response.status_code == 422
+
+    saved = client.get(f"/projects/{project_id}")
+
+    assert saved.status_code == 200
+    assert saved.json() == created
+
+def test_updating_one_project_does_not_change_another():
+    first = create_test_project()
+    second = create_test_project()
+
+    assert first["id"] != second["id"]
+
+    response = client.patch(
+        f"/projects/{first['id']}/status",
+        json={"status": "running"},
+    )
+    assert response.status_code == 200
+
+    updated = client.get(f"/projects/{first['id']}")
+    unchanged = client.get(f"/projects/{second['id']}")
+
+    assert updated.status_code == 200
+    assert updated.json()["status"] == "running"
+    assert unchanged.status_code == 200
+    assert unchanged.json() == second
+
+def test_invalid_description_types_return_422():
+    for description in [123, None]:
+        response = client.post(
+            "/projects",
+            json={"description": description},
+        )
+        assert response.status_code == 422
+
+
+def test_update_status_malformed_id_returns_422():
+    response = client.patch(
+        "/projects/not-a-uuid/status",
+        json={"status": "running"},
+    )
+    assert response.status_code == 422
