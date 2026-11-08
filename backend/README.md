@@ -57,6 +57,7 @@ cp .env.example .env
 | `TEST_DATABASE_URL` | Database pytest uses. **Must end in `_test`** — tests drop all its tables |
 | `CORS_ORIGINS` | Comma-separated frontend URLs allowed to call the API from a browser (default `http://localhost:5173`) |
 | `STATUS_API_KEY` | Secret required in the `X-API-Key` header for `PATCH /projects/{id}/status`. If unset, every status update is rejected |
+| `RATE_LIMIT_PER_MINUTE` | Projects one client (IP address) may create per minute (default `10`); more returns `429` |
 | `DEMO_STEP_DELAY_SECONDS` | Demo only: pause between tasks so progress is visible in the UI (default `1`; tests use `0`) |
 
 `.env` is git-ignored. Never commit it.
@@ -84,7 +85,7 @@ uvicorn main:app --reload
 | Method | Path | Success | Errors |
 |---|---|---|---|
 | `GET` | `/health` | `200 {"status": "ok"}` | — |
-| `POST` | `/projects` | `201` project (status `pending`) | `422` missing/blank description, description over 5,000 characters, or invalid optimization |
+| `POST` | `/projects` | `201` project (status `pending`) | `429` too many projects created this minute, `422` missing/blank description, description over 5,000 characters, or invalid optimization |
 | `GET` | `/projects/{project_id}` | `200` project with its tasks | `404` not found, `422` malformed ID |
 | `PATCH` | `/projects/{project_id}/status` | `200` updated project | `401` missing or wrong API key, `404` not found, `422` invalid status |
 
@@ -153,6 +154,8 @@ Poll `GET /projects/{id}` (the frontend does this every 2 seconds) until `status
     -d '{"status": "running"}'
   ```
 - **Descriptions are capped at 5,000 characters** (`422` above that).
+- **Project creation is rate-limited** to `RATE_LIMIT_PER_MINUTE` per client IP (default 10), since each project triggers AI work. The count is kept in memory: it is per server process and resets on restart.
+  - **On Railway**, visitors arrive through Railway's proxy. Start uvicorn with `--forwarded-allow-ips="*"` so it uses the visitor's real IP from the proxy's `X-Forwarded-For` header; otherwise every visitor looks like the proxy and they all share one limit.
 
 ## How processing works
 

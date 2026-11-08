@@ -6,7 +6,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from database import get_db, get_session_factory
-from security import require_status_api_key
+from security import limit_project_creation, project_creation_limiter, require_status_api_key
 from main import app
 from models import Base
 from orchestration import get_pipeline
@@ -59,6 +59,21 @@ def enforce_api_key(monkeypatch):
     app.dependency_overrides.pop(require_status_api_key, None)
     yield
     app.dependency_overrides[require_status_api_key] = lambda: None
+
+
+# Every test request comes from the same client ("testclient"), so a real rate limit would start
+# rejecting projects partway through the suite. It's off by default, like the API key check.
+app.dependency_overrides[limit_project_creation] = lambda: None
+
+
+@pytest.fixture
+def enforce_rate_limit():
+    """Use the real rate limit, starting from a clean count for this test."""
+    project_creation_limiter.reset()
+    app.dependency_overrides.pop(limit_project_creation, None)
+    yield
+    app.dependency_overrides[limit_project_creation] = lambda: None
+    project_creation_limiter.reset()
 
 
 @pytest.fixture(autouse=True)

@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import AfterValidator, BaseModel, StringConstraints
 from database import get_db, get_session_factory
 from orchestration import get_pipeline
-from security import require_status_api_key
+from security import limit_project_creation, require_status_api_key
 
 app = FastAPI(title="AI Build Router API")
 
@@ -103,7 +103,7 @@ def health_check():
     return {"status": "ok"}
 
 
-@app.post("/projects", status_code=201, response_model=ProjectResponse)
+@app.post("/projects", status_code=201, response_model=ProjectResponse, dependencies=[Depends(limit_project_creation)])
 def create_project(
     project: ProjectCreate,
     background_tasks: BackgroundTasks,
