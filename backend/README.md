@@ -56,6 +56,7 @@ cp .env.example .env
 | `DATABASE_URL` | Database the app uses, e.g. `postgresql+psycopg://yourname@localhost:5432/ai_build_router` |
 | `TEST_DATABASE_URL` | Database pytest uses. **Must end in `_test`** — tests drop all its tables |
 | `CORS_ORIGINS` | Comma-separated frontend URLs allowed to call the API from a browser (default `http://localhost:5173`) |
+| `STATUS_API_KEY` | Secret required in the `X-API-Key` header for `PATCH /projects/{id}/status`. If unset, every status update is rejected |
 | `DEMO_STEP_DELAY_SECONDS` | Demo only: pause between tasks so progress is visible in the UI (default `1`; tests use `0`) |
 
 `.env` is git-ignored. Never commit it.
@@ -83,9 +84,9 @@ uvicorn main:app --reload
 | Method | Path | Success | Errors |
 |---|---|---|---|
 | `GET` | `/health` | `200 {"status": "ok"}` | — |
-| `POST` | `/projects` | `201` project (status `pending`) | `422` missing/blank description or invalid optimization |
+| `POST` | `/projects` | `201` project (status `pending`) | `422` missing/blank description, description over 5,000 characters, or invalid optimization |
 | `GET` | `/projects/{project_id}` | `200` project with its tasks | `404` not found, `422` malformed ID |
-| `PATCH` | `/projects/{project_id}/status` | `200` updated project | `404` not found, `422` invalid status |
+| `PATCH` | `/projects/{project_id}/status` | `200` updated project | `401` missing or wrong API key, `404` not found, `422` invalid status |
 
 ### Create a project
 
@@ -142,7 +143,16 @@ Poll `GET /projects/{id}` (the frontend does this every 2 seconds) until `status
 - Timestamps are ISO 8601 in UTC (`Z`); convert to local time for display.
 - Errors use FastAPI's format: `{"detail": "Project not found"}` for 404, `{"detail": [{"loc": [...], "msg": "..."}]}` for 422.
 
-> `PATCH /projects/{project_id}/status` is currently unprotected. It will require an API key before public deployment.
+### Protection
+
+- **Status updates need an API key.** `PATCH /projects/{id}/status` requires an `X-API-Key` header matching the server's `STATUS_API_KEY`, otherwise it returns `401`. With no key configured, every status update is rejected. The frontend never calls this endpoint, so the key stays on trusted machines only:
+
+  ```bash
+  curl -X PATCH http://localhost:8000/projects/<id>/status \
+    -H "Content-Type: application/json" -H "X-API-Key: <your key>" \
+    -d '{"status": "running"}'
+  ```
+- **Descriptions are capped at 5,000 characters** (`422` above that).
 
 ## How processing works
 
