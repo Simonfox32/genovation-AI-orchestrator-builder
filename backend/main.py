@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import AfterValidator, BaseModel, StringConstraints
 from database import get_db, get_session_factory
 from orchestration import get_pipeline
+from security import require_status_api_key
 
 app = FastAPI(title="AI Build Router API")
 
@@ -138,7 +139,7 @@ def get_project(project_id: UUID, db : Session = Depends(get_db)):
     return project
 
 
-@app.patch("/projects/{project_id}/status", response_model=ProjectResponse, responses=NOT_FOUND)
+@app.patch("/projects/{project_id}/status", response_model=ProjectResponse, responses=NOT_FOUND, dependencies=[Depends(require_status_api_key)])
 def update_project_status(project_id: UUID, update: ProjectStatusUpdate, db : Session = Depends(get_db)):
     project = db.get(Project, project_id)
     if project is None:

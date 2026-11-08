@@ -6,6 +6,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from database import get_db, get_session_factory
+from security import require_status_api_key
 from main import app
 from models import Base
 from orchestration import get_pipeline
@@ -45,6 +46,19 @@ def no_pipeline():
     app.dependency_overrides[get_pipeline] = lambda: (lambda project_id, session_factory: None)
     yield
     app.dependency_overrides.pop(get_pipeline, None)
+
+# Most tests aren't about the API key, so the key check is replaced with a function that does nothing.
+# Tests about the key use the enforce_api_key fixture to switch the real check back on.
+app.dependency_overrides[require_status_api_key] = lambda: None
+
+
+@pytest.fixture
+def enforce_api_key(monkeypatch):
+    """Use the real API key check, with the server's key set to 'test-key' for this test."""
+    monkeypatch.setenv("STATUS_API_KEY", "test-key")
+    app.dependency_overrides.pop(require_status_api_key, None)
+    yield
+    app.dependency_overrides[require_status_api_key] = lambda: None
 
 
 @pytest.fixture(autouse=True)
