@@ -34,7 +34,7 @@ Your prompt should now start with `(.venv)`. Then install dependencies:
 pip install -r requirements-dev.txt
 ```
 
-`requirements.txt` holds what the app needs to run; `requirements-dev.txt` adds testing tools.
+`requirements-dev.txt` adds testing tools to the runtime dependencies. The runtime list itself lives in the repo-root `requirements.txt`, because Railway installs dependencies from the root before copying the rest of the code; `backend/requirements.txt` just points to it. Add new runtime dependencies to the root file.
 
 ### Database and `.env`
 
