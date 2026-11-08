@@ -1,0 +1,31 @@
+import os
+
+from dotenv import load_dotenv
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+load_dotenv()  # Reads backend/.env into environment variables (no-op if the file doesn't exist)
+
+DATABASE_URL = os.environ["DATABASE_URL"]  # Crash at startup if missing, rather than on the first request
+
+# Creates DB connection, if connection is closed, new connection will be created 
+
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+SessionLocal = sessionmaker(bind=engine)
+
+
+def get_db():
+    """Give one request its own database session, and always close it afterward."""
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+def get_session_factory():
+    """Give background work a way to open its own sessions after the request's session is closed.
+
+    A dependency (rather than importing SessionLocal directly) so tests can point it at the test database.
+    """
+    return SessionLocal

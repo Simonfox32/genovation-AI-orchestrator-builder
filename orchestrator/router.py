@@ -30,6 +30,7 @@ def route(module):
                 "tool_used": tool.__name__,
                 "tries": tries,
                 "status": "passed",
+                "code": result,
             }
     return {
         "name": module["name"],
@@ -58,5 +59,7 @@ modules = [
     },
 ]
 
-for module in modules:
-    print(route(module))
+# Only run the demo when this file is executed directly (python router.py), not when imported.
+if __name__ == "__main__":
+    for module in modules:
+        print(route(module))

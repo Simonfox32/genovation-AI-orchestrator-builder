@@ -1,0 +1,94 @@
+import os
+
+import pytest
+from dotenv import load_dotenv
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+from database import get_db, get_session_factory
+from security import limit_project_creation, project_creation_limiter, require_status_api_key
+from main import app
+from models import Base
+from orchestration import get_pipeline
+
+load_dotenv()
+
+os.environ["DEMO_STEP_DELAY_SECONDS"] = "0"  # No artificial delay in tests
+
+TEST_DATABASE_URL = os.environ["TEST_DATABASE_URL"]
+
+# Safety check: these fixtures drop every table, so refuse to run against anything that
+# isn't clearly a test database (e.g. if TEST_DATABASE_URL is copied from DATABASE_URL by mistake).
+if not TEST_DATABASE_URL.rsplit("/", 1)[-1].endswith("_test"):
+    raise RuntimeError(f"TEST_DATABASE_URL must point to a database ending in '_test', got: {TEST_DATABASE_URL}")
+
+test_engine = create_engine(TEST_DATABASE_URL)
+TestSessionLocal = sessionmaker(bind=test_engine)
+
+
+def override_get_db():
+    db = TestSessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+# Every request made through TestClient now gets a test-database session instead of a dev one,
+# and the background pipeline opens its sessions on the test database too.
+app.dependency_overrides[get_db] = override_get_db
+app.dependency_overrides[get_session_factory] = lambda: TestSessionLocal
+
+
+@pytest.fixture
+def no_pipeline():
+    """For tests about the API itself: create projects without running the background pipeline."""
+    app.dependency_overrides[get_pipeline] = lambda: (lambda project_id, session_factory: None)
+    yield
+    app.dependency_overrides.pop(get_pipeline, None)
+
+# Most tests aren't about the API key, so the key check is replaced with a function that does nothing.
+# Tests about the key use the enforce_api_key fixture to switch the real check back on.
+app.dependency_overrides[require_status_api_key] = lambda: None
+
+
+@pytest.fixture
+def enforce_api_key(monkeypatch):
+    """Use the real API key check, with the server's key set to 'test-key' for this test."""
+    monkeypatch.setenv("STATUS_API_KEY", "test-key")
+    app.dependency_overrides.pop(require_status_api_key, None)
+    yield
+    app.dependency_overrides[require_status_api_key] = lambda: None
+
+
+# Every test request comes from the same client ("testclient"), so a real rate limit would start
+# rejecting projects partway through the suite. It's off by default, like the API key check.
+app.dependency_overrides[limit_project_creation] = lambda: None
+
+
+@pytest.fixture
+def enforce_rate_limit():
+    """Use the real rate limit, starting from a clean count for this test."""
+    project_creation_limiter.reset()
+    app.dependency_overrides.pop(limit_project_creation, None)
+    yield
+    app.dependency_overrides[limit_project_creation] = lambda: None
+    project_creation_limiter.reset()
+
+
+@pytest.fixture(autouse=True)
+def clean_database():
+    """Give every test empty tables, so no test depends on what another test left behind."""
+    Base.metadata.drop_all(test_engine)
+    Base.metadata.create_all(test_engine)
+    yield
+
+
+@pytest.fixture
+def db_session():
+    """A separate session for tests that want to look at the database directly."""
+    db = TestSessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
