@@ -27,7 +27,7 @@ A user submits a project description, the backend stores it and processes it in 
 | Decomposer (description → modules) | **Stub** — every project gets the same sample modules (test data) |
 | AI tools | **Simulated** — the router's tools return hard-coded code; no AI model is called yet |
 
-Not deployed yet (Railway/Supabase is next).
+**Deployed backend:** https://genovation-ai-orchestrator-builder-production.up.railway.app (Railway, with the database on Supabase). The frontend still runs locally until Sprint 5; point it at the deployed API with `VITE_API_BASE_URL`. Setup details: [backend/README.md](backend/README.md#deploying-railway--supabase).
 
 ## Run the Full Stack Locally
 

@@ -4,6 +4,8 @@ FastAPI backend for AI Build Router. It receives project descriptions from the f
 
 For running the whole stack (database + backend + frontend), see the [root README](../README.md).
 
+**Deployed:** https://genovation-ai-orchestrator-builder-production.up.railway.app (API docs at `/docs`). See [Deploying](#deploying-railway--supabase).
+
 ## Prerequisites
 
 - Python 3.12 or newer (developed on 3.14). **Check with `python3 --version` before creating the virtual environment.** On macOS, the built-in `/usr/bin/python3` is 3.9, which is too old; install a newer one (`brew install python`) and, if `python3` still reports 3.9, create the environment with the full path instead, e.g. `/opt/homebrew/bin/python3 -m venv .venv`.
@@ -170,6 +172,50 @@ Poll `GET /projects/{id}` (the frontend does this every 2 seconds) until `status
 
 **Known limitation:** background tasks run inside the web server process. If the server restarts mid-run, that project stays `running`.
 
+## Deploying (Railway + Supabase)
+
+The API runs on **Railway** and the database on **Supabase** (free plan). The app only knows `DATABASE_URL`, so moving between local Postgres and Supabase is configuration, not code.
+
+### Database: Supabase
+
+1. Create a project. Use a database password with **only letters and numbers**: symbols like `@`, `)`, or `?` break URL and shell parsing.
+2. **Turn off the Data API** (Integrations → Data API → Enable Data API). The backend talks to Postgres directly, and tables created by Alembic have no Row Level Security, so the auto-generated REST API would expose them.
+3. **Connect → Session pooler**, copy the URI, then: change `postgresql://` to `postgresql+psycopg://`, insert the password (no brackets), and add `?sslmode=require`. Use the **session pooler**, not the direct connection (IPv6-only on the free plan) or the transaction pooler (breaks prepared statements).
+4. Create the tables from your machine: put `DATABASE_URL='...'` (quoted) in `backend/.env.supabase` (git-ignored) and run `(set -a; source .env.supabase; alembic upgrade head)`.
+
+> **Free projects pause after about a week without activity.** A paused project makes the pooler answer `tenant/user postgres.<ref> not found`. Restore it from the Supabase dashboard (data is kept), and open the dashboard a few minutes before any demo.
+
+### API: Railway
+
+Create a service with **Deploy from GitHub repo**, then set:
+
+| Setting | Value |
+|---|---|
+| Source → Branch | `main` |
+| Source → Root Directory | **empty** (repo root), so `orchestrator/` is included |
+| Deploy → Custom Start Command | `cd backend && uvicorn main:app --host 0.0.0.0 --port $PORT --forwarded-allow-ips="*"` |
+| Deploy → Pre-deploy Command | `cd backend && alembic upgrade head` (applies new migrations before each release) |
+| Deploy → Healthcheck Path | `/health` |
+| Region | Near the Supabase region (ours: US West) |
+| Build → Watch Paths *(optional)* | `backend/**`, `orchestrator/**`, `requirements.txt`, `.python-version` |
+| Networking | **Generate Domain** after the variables are set |
+
+**Variables:** `DATABASE_URL` (the Supabase URL, without quotes), `STATUS_API_KEY` (a new random key, different from local), `CORS_ORIGINS` (`http://localhost:5173`, plus the Vercel URL once the frontend is deployed), `RATE_LIMIT_PER_MINUTE` (`10`), `DEMO_STEP_DELAY_SECONDS` (`1`).
+
+Railway's builder finds Python from the repo root: `.python-version` sets 3.14 and the root `requirements.txt` holds the pinned dependency list. Pushing to `main` redeploys automatically.
+
+### Checking a deployment
+
+```bash
+U=https://genovation-ai-orchestrator-builder-production.up.railway.app
+curl $U/health                                              # {"status":"ok"}
+curl -X POST $U/projects -H "Content-Type: application/json" -d '{"description":"Deploy check"}'
+curl $U/projects/<id>                                       # completed after a few seconds
+curl -X PATCH $U/projects/<id>/status -H "Content-Type: application/json" -d '{"status":"running"}'   # 401 without X-API-Key
+```
+
+To use the local frontend with the deployed API, set `VITE_API_BASE_URL` to the Railway URL in `frontend/.env.local` and restart `npm run dev`.
+
 ## Migrations
 
 The schema is managed with Alembic. After changing `models.py`:
@@ -206,6 +252,9 @@ Tests use `TEST_DATABASE_URL` and recreate the tables before every test, so they
 
 | Problem | Fix |
 |---|---|
+| `tenant/user postgres.<ref> not found` | The Supabase project is paused (or the pooler host/user was copied wrong): restore it in the dashboard |
+| Railway build: `No such file or directory: '/app/backend/requirements.txt'` | The root `requirements.txt` must hold the real list; Railway installs dependencies before copying the rest of the code |
+| Railway: `No module named 'orchestrator'` | The service's Root Directory must be empty (repo root) |
 | Only `README.md` in the repo | You're on `main` — run `git switch dev` |
 | `No matching distribution found for sqlalchemy<3,>=2.1` | Your virtual environment uses Python older than 3.11. Delete `.venv` and recreate it with a newer Python (see Prerequisites) |
 | `command not found: uvicorn` / `pytest` / `alembic` | Activate the virtual environment |
