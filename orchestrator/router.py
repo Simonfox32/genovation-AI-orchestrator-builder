@@ -39,6 +39,7 @@ def route(module, optimization="cheap"):
                 "tool_used": tool.__name__,
                 "tries": tries,
                 "status": "passed",
+                "code": result,
             }
     return {
         "name": module["name"],
@@ -65,6 +66,9 @@ multiply_module = {
     "expected": 6,
     "status": "waiting",
 }
+
+# Simon's backend (backend/orchestration.py) reads router.modules, so keep this list.
+modules = [add_module, multiply_module]
 
 if __name__ == "__main__":
     # tests (#114)
