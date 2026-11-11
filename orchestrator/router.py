@@ -7,6 +7,13 @@ def medium_tool(module_name):
 def strong_tool(module_name):
     return "def add(a, b):\n    return a + b"
 
+SETTINGS = {
+    "cheap": {"start": 0, "max_attempts": 3},
+    "speed": {"start": 0, "max_attempts": 3},
+    "balanced": {"start": 1, "max_attempts": 2},
+    "quality": {"start": 2, "max_attempts": 1},
+}
+
 def check(code, module):
     try:
         namespace = {}
@@ -16,8 +23,11 @@ def check(code, module):
     except Exception:
         return False
 
-def route(module):
+def route(module, optimization="cheap"):
+    settings = SETTINGS[optimization]
     tools = [cheap_tool, medium_tool, strong_tool]
+    tools = tools[settings["start"]:]
+    tools = tools[:settings["max_attempts"]]
     tries = 0
     for tool in tools:
         tries = tries + 1
@@ -40,26 +50,32 @@ def route(module):
     }
 
 
-modules = [
-    {
-        "name": "add function",
-        "description": "adds two numbers",
-        "function_name": "add",
-        "test_input": (2, 3),
-        "expected": 5,
-        "status": "waiting",
-    },
-    {
-        "name": "multiply function",
-        "description": "multiplies two numbers",
-        "function_name": "multiply",
-        "test_input": (2, 3),
-        "expected": 6,
-        "status": "waiting",
-    },
-]
+add_module = {
+    "name": "add function",
+    "description": "adds two numbers",
+    "function_name": "add",
+    "test_input": (2, 3),
+    "expected": 5,
+    "status": "waiting",
+}
 
-# Only run the demo when this file is executed directly (python router.py), not when imported.
+multiply_module = {
+    "name": "multiply function",
+    "description": "multiplies two numbers",
+    "function_name": "multiply",
+    "test_input": (2, 3),
+    "expected": 6,
+    "status": "waiting",
+}
+
+# Simon's backend (backend/orchestration.py) reads router.modules, so keep this list.
+modules = [add_module, multiply_module]
+
 if __name__ == "__main__":
-    for module in modules:
-        print(route(module))
+    # tests (#114)
+    assert route(add_module, "cheap")["tries"] == 3
+    assert route(add_module, "balanced")["tries"] == 2
+    assert route(add_module, "speed")["tries"] == 3
+    assert route(add_module, "quality")["tries"] == 1
+    assert route(multiply_module, "quality")["status"] == "failed"
+    print("all tests passed")
