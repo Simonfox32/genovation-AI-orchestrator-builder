@@ -1,20 +1,13 @@
-
 * {
   box-sizing: border-box;
 }
-
-/*#sample one black and white
-
-#sample two blue and white*/
-
-
 
 body {
   margin: 0;
   display: block;
   min-width: 320px;
-  background: #f4f6fb;
-  color: #202636;
+  background: #312366;
+  color: #ffffff;
   font-family: Arial, sans-serif;
 }
 
@@ -27,19 +20,14 @@ body {
 }
 
 .header {
-  background: #1e293b;
-  color: black;
+  background: #312366;
+  color: #ffffff;
   padding: 26px;
   text-align: center;
 }
 
-.header h1 {
-  margin: 10;
-}
-
-.header p {
-  color: #cbd5e1;
-}
+.header h1 { margin: 10px 0; }
+.header p { color: #e3dcff; }
 
 .container {
   max-width: 850px;
@@ -48,42 +36,46 @@ body {
 }
 
 .card {
-  background: white;
+  background: #4723CF;
+  color: #ffffff;
   padding: 28px;
   margin-bottom: 24px;
   border-radius: 12px;
-  box-shadow: 0 4px 16px #00000012;
+  box-shadow: 0 4px 16px #00000030;
 }
 
-.card h2 {
-  margin-top: 0;
-  color: black;
-}
-
-form {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-
-label {
-  font-weight: bold;
-  margin-top: 12px;
-}
+.card h2 { margin-top: 0; color: #ffffff; }
+.project-intro { text-align: center; margin-bottom: 20px; }
+form { display: flex; flex-direction: column; gap: 12px; }
+label { font-weight: bold; margin-top: 12px; }
 
 textarea, select {
   width: 100%;
   padding: 12px;
-  border: 1px solid #cbd5e1;
+  border: 1px solid #b9a8ff;
   border-radius: 7px;
-  background: white;
-  color: #202636;
+  background: #211548;
+  color: #ffffff;
   font: inherit;
 }
 
+textarea::placeholder {
+  color: #c7b8ed;
+}
+
+select option {
+  background: #211548;
+  color: #ffffff;
+}
+
+textarea:focus, select:focus {
+  outline: 2px solid #b9a8ff;
+  outline-offset: 1px;
+}
+
 .generate-btn {
-  background: #2563eb;
-  color: white;
+  background: #312366;
+  color: #ffffff;
   padding: 14px;
   border: none;
   border-radius: 8px;
@@ -91,128 +83,42 @@ textarea, select {
   font-size: 16px;
   margin-top: 18px;
 }
-
-.generate-btn:hover {
-  background: #1d4ed8;
-}
-
-.generate-btn:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-.demo-label {
-  color: #64748b;
-  font-size: 14px;
-}
+.generate-btn:hover { background: #24194d; }
+.generate-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.demo-label { color: #e3dcff; font-size: 14px; }
 
 .summary {
   padding: 14px;
-  background: #f1f5f9;
+  background: #39209a;
   border-radius: 8px;
   overflow-wrap: anywhere;
 }
-
-.progress-bar {
-  height: 13px;
-  background: #e2e8f0;
-  border-radius: 10px;
-  overflow: hidden;
-}
-
-.progress-fill {
-  width: 50%;
-  height: 100%;
-  background: #2563eb;
-}
-
-.task-list {
-  margin-top: 20px;
-}
-
+.progress-bar { height: 13px; background: #211548; border-radius: 10px; overflow: hidden; }
+.progress-fill { width: 50%; height: 100%; background: #a391e5; }
+.task-list { margin-top: 20px; }
 .task {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
   padding: 16px 0;
-  border-bottom: 1px solid #e2e8f0;
+  border-bottom: 1px solid #886ce8;
 }
+.task p { margin-bottom: 0; color: #e3dcff; }
+.status { border-radius: 20px; padding: 7px 12px; font-size: 13px; white-space: nowrap; }
+.completed { color: #166534; background: #dcfce7; }
+.running { color: #1d4ed8; background: #dbeafe; }
+.pending { color: #475569; background: #f1f5f9; }
+.output-box { background: #39209a; padding: 18px; border-radius: 8px; }
+.output-box code { display: block; margin: 8px 0; color: #ffffff; }
 
-.task p {
-  margin-bottom: 0;
-  color: #64748b;
-}
-
-.status {
-  border-radius: 20px;
-  padding: 7px 12px;
-  font-size: 13px;
-  white-space: nowrap;
-}
-
-.completed {
-  color: #166534;
-  background: #dcfce7;
-}
-
-.running {
-  color: #1d4ed8;
-  background: #dbeafe;
-}
-
-.pending {
-  color: #475569;
-  background: #f1f5f9;
-}
-
-.output-box {
-  background: #f1f5f9;
-  padding: 18px;
-  border-radius: 8px;
-}
-
-.output-box code {
-  display: block;
-  margin: 8px 0;
-  color: #334155;
-}
-
-@media (max-width: 500px) {
-  .task {
-    align-items: flex-start;
-    flex-direction: column;
-  }
-}
-
-
-/* Checkbox settings */
-
-.checkbox-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  font-weight: normal;
-}
-
-.checkbox-row input {
-  width: auto;
-}
-
-/* Request JSON preview */
-
-.json-section {
-  margin-top: 20px;
-}
-
-.json-section summary {
-  cursor: pointer;
-  font-weight: bold;
-}
-
+.checkbox-row { display: flex; align-items: center; gap: 10px; font-weight: normal; }
+.checkbox-row input { width: auto; }
+.json-section { margin-top: 20px; }
+.json-section summary { cursor: pointer; font-weight: bold; }
 .json-box {
-  background: #172033;
-  color: #e2e8f0;
+  background: #211548;
+  color: #e9e2ff;
   padding: 16px;
   border-radius: 8px;
   overflow-x: auto;
@@ -221,56 +127,14 @@ textarea, select {
   font-family: Consolas, monospace;
   font-size: 13px;
 }
+.results-header { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; }
+.refresh-btn { padding: 9px 14px; background: #312366; color: #ffffff; border: none; border-radius: 7px; cursor: pointer; }
+.refresh-btn:hover { background: #24194d; }
+.failed { background: #fee2e2; color: #991b1b; }
+.error-message { background: #fee2e2; color: #991b1b; padding: 16px; border-radius: 8px; margin-bottom: 20px; }
+.output-box details { margin-bottom: 12px; }
+.output-box summary { cursor: pointer; font-weight: bold; }
 
-/* Dashboard header */
-
-.results-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 12px;
-}
-
-/* Refresh button */
-
-.refresh-btn {
-  padding: 9px 14px;
-  background: #e2e8f0;
-  color: #1e293b;
-  border: none;
-  border-radius: 7px;
-  cursor: pointer;
-}
-
-.refresh-btn:hover {
-  background: #cbd5e1;
-}
-
-/* Failed task */
-
-.failed {
-  background: #fee2e2;
-  color: #991b1b;
-}
-
-/* API errors */
-
-.error-message {
-  background: #fee2e2;
-  color: #991b1b;
-  padding: 16px;
-  border-radius: 8px;
-  margin-bottom: 20px;
-}
-
-/* File details */
-
-.output-box details {
-  margin-bottom: 12px;
-}
-
-.output-box summary {
-  cursor: pointer;
-  font-weight: bold;
+@media (max-width: 500px) {
+  .task { align-items: flex-start; flex-direction: column; }
 }

@@ -138,10 +138,10 @@ function App() {
   // User inputs
   // (Preferred model and "include tests" controls are hidden until the orchestrator uses them)
   const [prompt, setPrompt] = useState('')
-  const [optimization, setOptimization] = useState<Optimization>('balanced')
+  const [optimization, setOptimization] = useState<Optimization>('speed')
 
   // Data source: local JSON or real backend
-  const [mode, setMode] = useState<'demo' | 'backend'>('demo')
+  const [mode] = useState<'demo' | 'backend'>('demo')
 
   // Data received from JSON
   const [result, setResult] = useState<BackendResult | null>(null)
@@ -274,8 +274,10 @@ function App() {
       <main className="container">
         {/* INPUT SECTION */}
         <section className="card">
-          <h2>Create a Project</h2>
-          <p>Describe what you want the AI to build.</p>
+          <div className="project-intro">
+            <h2>Create a Project</h2>
+            <p>Describe what you want the AI to build.</p>
+          </div>
 
           <form onSubmit={handleGenerate}>
             <label htmlFor="prompt">Your Prompt</label>
@@ -295,24 +297,8 @@ function App() {
               value={optimization}
               onChange={e => setOptimization(e.target.value as Optimization)}
             >
-              <option value="balanced">Balanced</option>
               <option value="speed">Fastest</option>
               <option value="quality">Best Quality</option>
-            </select>
-
-            <label htmlFor="mode">Data Source</label>
-
-            <select
-              id="mode"
-              value={mode}
-              onChange={e => {
-                setMode(e.target.value as 'demo' | 'backend')
-                setResult(null)
-                setError('')
-              }}
-            >
-              <option value="demo">Local JSON (Demo)</option>
-              <option value="backend">Backend API</option>
             </select>
 
             <button
@@ -324,13 +310,6 @@ function App() {
             </button>
           </form>
 
-          {/* Show the JSON that would be sent */}
-          <details className="json-section">
-            <summary>Preview JSON Request</summary>
-            <pre className="json-box">
-              {JSON.stringify(requestData, null, 2)}
-            </pre>
-          </details>
         </section>
 
         {/* ERROR SECTION */}
@@ -451,13 +430,6 @@ function App() {
               </>
             )}
 
-            {/* Raw backend response for debugging */}
-            <details className="json-section">
-              <summary>View Raw Backend JSON</summary>
-              <pre className="json-box">
-                {JSON.stringify(result, null, 2)}
-              </pre>
-            </details>
           </section>
         )}
       </main>
