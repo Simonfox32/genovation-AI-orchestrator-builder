@@ -9,6 +9,7 @@ def strong_tool(module_name):
 
 SETTINGS = {
     "cheap": {"start": 0, "max_attempts": 3},
+    "speed": {"start": 0, "max_attempts": 3},
     "balanced": {"start": 1, "max_attempts": 2},
     "quality": {"start": 2, "max_attempts": 1},
 }
@@ -74,6 +75,7 @@ if __name__ == "__main__":
     # tests (#114)
     assert route(add_module, "cheap")["tries"] == 3
     assert route(add_module, "balanced")["tries"] == 2
+    assert route(add_module, "speed")["tries"] == 3
     assert route(add_module, "quality")["tries"] == 1
     assert route(multiply_module, "quality")["status"] == "failed"
     print("all tests passed")

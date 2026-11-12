@@ -3,7 +3,7 @@ import importlib
 import sys
 
 from fastapi.testclient import TestClient
-
+import pytest
 import orchestration
 from main import app
 
@@ -11,7 +11,7 @@ client = TestClient(app)
 
 
 def submit(description="Build me a workout tracker"):
-    response = client.post("/projects", json={"description": description})
+    response = client.post("/projects", json={"description": description, "optimization":"speed"})
     assert response.status_code == 201
     return response.json()
 
@@ -87,3 +87,20 @@ def test_importing_router_has_no_side_effects(capsys):
     importlib.import_module("orchestrator.router")
 
     assert capsys.readouterr().out == ""
+
+@pytest.mark.parametrize(
+    "optimization, expected_tries",
+    [
+        ("balanced", 2),
+        ("speed", 3),
+        ("quality", 1),
+    ],
+)
+def test_optimization_setting_controls_how_many_tools_are_tried(optimization, expected_tries):
+    response = client.post("/projects", json={"description": "test description", "optimization": optimization}).json()          
+    
+    project = client.get(f"/projects/{response['id']}").json()
+    add_task = project["tasks"][0]
+    assert add_task["name"] == "add function"
+    assert add_task["attempts"] == expected_tries
+        

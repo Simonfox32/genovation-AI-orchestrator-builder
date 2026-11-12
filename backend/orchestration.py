@@ -68,7 +68,7 @@ def run_pipeline(project_id: UUID, session_factory) -> None:
             db.commit()
             time.sleep(delay)
 
-            result = router.route(module)
+            result = router.route(module, project.optimization)
             task.tool = result["tool_used"]
             task.attempts = result["tries"]
             task.status = ROUTER_STATUS_TO_TASK_STATUS[result["status"]]
