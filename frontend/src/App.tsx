@@ -138,7 +138,7 @@ function App() {
   // User inputs
   // (Preferred model and "include tests" controls are hidden until the orchestrator uses them)
   const [prompt, setPrompt] = useState('')
-  const [optimization, setOptimization] = useState<Optimization>('speed')
+  const [optimization, setOptimization] = useState<Optimization>('balanced')
 
   // Data source: the real backend (at VITE_API_BASE_URL). Change to 'demo' to use the local sample JSON.
   const [mode] = useState<'demo' | 'backend'>('backend')
@@ -297,6 +297,7 @@ function App() {
               value={optimization}
               onChange={e => setOptimization(e.target.value as Optimization)}
             >
+              <option value="balanced">Balanced</option>
               <option value="speed">Fastest</option>
               <option value="quality">Best Quality</option>
             </select>
