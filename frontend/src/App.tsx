@@ -140,8 +140,8 @@ function App() {
   const [prompt, setPrompt] = useState('')
   const [optimization, setOptimization] = useState<Optimization>('speed')
 
-  // Data source: local JSON or real backend
-  const [mode] = useState<'demo' | 'backend'>('demo')
+  // Data source: the real backend (at VITE_API_BASE_URL). Change to 'demo' to use the local sample JSON.
+  const [mode] = useState<'demo' | 'backend'>('backend')
 
   // Data received from JSON
   const [result, setResult] = useState<BackendResult | null>(null)
