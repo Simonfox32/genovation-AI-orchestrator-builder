@@ -43,15 +43,17 @@ def parse_modules(text):
 def fake_llm(prompt):
     return '[{"name": "add function", "description": "adds two numbers", "function_name": "add", "test_input": [2, 3], "expected": 5}]'
 
-def decompose(request, llm=None):
+def decompose(description, optimization="balanced", llm=None):
+    """Turn a project description into modules for the router.
+
+    Matches the backend's call: decompose(description, optimization). `optimization` isn't used yet.
+    With no `llm`, returns the fixed sample module. With an `llm`, errors are raised, not hidden,
+    so the backend can mark the project as failed instead of showing a fake plan.
+    """
     if llm is None:
         return copy.deepcopy(FALLBACK_MODULES)
-    try:
-        reply = llm(build_prompt(request))
-        return parse_modules(reply)
-    except Exception as error:
-        print("decompose fell back to the fixed module:", error)
-        return copy.deepcopy(FALLBACK_MODULES)
+    reply = llm(build_prompt(description))
+    return parse_modules(reply)
 
 if __name__ == "__main__":
     from router import route
@@ -68,11 +70,19 @@ if __name__ == "__main__":
 
     def bad_llm(prompt):
         return "sorry, I can't do that"
-    assert decompose("x", llm=bad_llm)[0]["function_name"] == "add"
+    try:
+        decompose("x", llm=bad_llm)
+        assert False, "a reply with no JSON list should raise"
+    except ValueError:
+        pass
 
     def broken_llm(prompt):
         raise TimeoutError("API took too long")
-    assert decompose("x", llm=broken_llm)[0]["function_name"] == "add"
+    try:
+        decompose("x", llm=broken_llm)
+        assert False, "an LLM error should raise"
+    except TimeoutError:
+        pass
 
     bad_reply = '[{"name": "x", "description": "y", "function_name": "z", "test_input": [1]}]'
     try:
