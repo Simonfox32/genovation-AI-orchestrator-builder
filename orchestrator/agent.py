@@ -59,12 +59,19 @@ Work in two steps.
 
 STEP 1: turn the request into a proper system. Requests are often vague ("a grocery store with transactions");
 your job is to expand them into what a real system of that kind needs. Write tests/REQUIREMENTS.md:
-- A numbered list of requirements, one per line, in plain English, most important first, 8 to 15 of them:
+- A numbered list of requirements, one per line, in plain English, most important first, 10 to 18 of them:
   - the things to store, including the ones a real system of this kind needs even if the request didn't name
     them (e.g. a store needs products with server-side prices and stock; a transaction references products)
   - the actions on them (create, list, fetch, and domain actions like pay, refund, cancel)
   - the business rules that make it correct (e.g. "the server computes totals from product prices",
     "a purchase can't exceed stock", "a refund restores stock")
+  - the edge cases of those rules, each as its OWN numbered requirement, because bugs hide there. Think like
+    someone trying to break the rules:
+      - the same item twice in one request (e.g. 3 + 3 of a product with stock 5 must be rejected, as 6 > 5)
+      - exact boundaries (buying exactly the remaining stock succeeds; one more fails)
+      - doing an action twice (refunding twice), or in the wrong state (refunding a cancelled order)
+      - one user's data never showing up in another user's results
+      - a rejected request changes nothing (stock and totals stay as they were)
   - errors: unknown ids return 404, invalid input returns 422
 - Then a section "## Assumptions" listing, one per line, what you added or decided that the request didn't say.
 Stay within the domain: no generic extras like a root or health endpoint.
