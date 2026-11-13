@@ -15,6 +15,11 @@ load_dotenv()
 
 os.environ["DEMO_STEP_DELAY_SECONDS"] = "0"  # No artificial delay in tests
 
+# Tests never call the real Gemini API, even if a developer's .env has a key: use the sample plan
+# and the simulated tools. Tests that need an LLM pass in a fake one.
+os.environ.pop("GEMINI_API_KEY", None)
+os.environ.pop("ROUTER_TOOLS", None)
+
 TEST_DATABASE_URL = os.environ["TEST_DATABASE_URL"]
 
 # Safety check: these fixtures drop every table, so refuse to run against anything that
