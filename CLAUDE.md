@@ -57,6 +57,10 @@ backend/.venv/bin/python spike/agent_loop.py [model] [max_steps]
 - `ORCHESTRATOR=agent-team`: a tester agent (role `tester`) writes `tests/test_app.py` from the user's description,
   then the builder makes it pass. User text steers server-run code here; `agent.FORBIDDEN` is only a speed bump.
   Rehearse from the terminal: `backend/.venv/bin/python orchestrator/agent.py "a store with orders"`.
+  The tester first writes `tests/REQUIREMENTS.md` (numbered); every requirement needs a `test_r<n>_...` test.
+- In agent modes the dashboard's Optimization picks the model for both agents (Anula's tiers in `router.py`):
+  Fastest = cheap, Balanced = medium, Best Quality = strong. After 1 failure or 60s timeout the agent
+  switches to the medium model for the rest of the run, and the summary says so.
 
 Tests never call Gemini: `tests/conftest.py` removes these variables; tests that need an LLM pass in a fake one.
 

@@ -9,6 +9,7 @@ What is real depends on configuration:
                            simulated tools that return hard-coded code.
 """
 import logging
+import re
 import os
 import sys
 import time
@@ -17,6 +18,7 @@ from pathlib import Path
 from uuid import UUID, uuid4
 import shutil
 import tempfile
+import threading
 
 
 # orchestrator/ lives beside backend/, so put the repo root on the import path.
@@ -33,6 +35,10 @@ logger = logging.getLogger(__name__)
 
 # The router reports "passed"/"failed"; the API and database use the shared status vocabulary.
 ROUTER_STATUS_TO_TASK_STATUS = {"passed": "completed", "failed": "failed"}
+
+# Agent projects run one at a time in this process (see run_agent_pipeline). One uvicorn process on Railway,
+# so a process-level lock is enough; several processes would need a database-level queue instead.
+AGENT_SLOT = threading.Semaphore(1)
 
 
 def get_llm():
@@ -127,6 +133,7 @@ def run_agent_pipeline(project_id: UUID, session_factory, with_tester: bool = Fa
     """
     db = session_factory()
     workspace_root = Path(tempfile.mkdtemp(prefix="agent-"))
+    holding_slot = False
 
     try:
         project = db.get(Project, project_id)
@@ -134,18 +141,29 @@ def run_agent_pipeline(project_id: UUID, session_factory, with_tester: bool = Fa
             logger.warning("Agent pipeline started for missing project %s", project_id)
             return
 
+        # One agent project at a time: two at once exceed the free Gemini tier's per-minute limit (429s).
+        if not AGENT_SLOT.acquire(blocking=False):
+            project.summary = ("Queued: another project is being built right now. The free Gemini tier allows "
+                               "one at a time; this one starts as soon as it finishes.")
+            _touch(project)
+            db.commit()
+            AGENT_SLOT.acquire()  # wait our turn
+        holding_slot = True
+
         workspace = workspace_root / "workspace"
         shutil.copytree(agent.TEMPLATE, workspace, ignore=shutil.ignore_patterns("__pycache__"))  # no stale caches
+        model = agent.model_for(project.optimization)  # Fastest / Balanced / Best Quality -> cheap / medium / strong
+        tester = None
         if with_tester:
             for old_test in (workspace / "tests").glob("test_*.py"):
                 old_test.unlink()  # the tester writes the requirements instead
             what = "your backend"
-            project.summary = (f"Two AI agents ({agent.MODEL}) are working: a tester is writing tests from your "
+            project.summary = (f"Two AI agents ({model}) are working: a tester is writing tests from your "
                                "description; then a developer builds the backend until they pass.")
         else:
             what = "a todo API"
             requirements = f"Requirements: the built-in todo API test suite ({_count_tests(workspace)} tests)."
-            project.summary = f"An AI agent ({agent.MODEL}) is building a todo API. {requirements}"
+            project.summary = f"An AI agent ({model}) is building a todo API. {requirements}"
         project.status = "running"
         _touch(project)
         db.commit()
@@ -165,7 +183,8 @@ def run_agent_pipeline(project_id: UUID, session_factory, with_tester: bool = Fa
 
         if with_tester:
             tester = agent.run_agent(workspace, on_step=make_saver("Tester · ", tester=True), role="tester",
-                                     start_message=agent.tester_message(project.description), max_steps=12)
+                                     start_message=agent.tester_message(project.description), max_steps=12,
+                                     model=model)
             if not tester["passed"]:
                 project.tasks.append(Task(
                     id=uuid4(), position=len(project.tasks) + 1,
@@ -178,13 +197,16 @@ def run_agent_pipeline(project_id: UUID, session_factory, with_tester: bool = Fa
                 _touch(project)
                 db.commit()
                 return
-            requirements = f"Requirements: {_count_tests(workspace)} tests written by the tester agent from your description."
+            requirements = (f"Requirements: {_count_requirements(workspace)} listed by the tester agent from your "
+                            f"description, covered by {_count_tests(workspace)} tests.")
             project.summary = f"The tester wrote the requirements; a developer agent is now building {what}. {requirements}"
             _touch(project)
             db.commit()
 
         outcome = agent.run_agent(workspace, on_step=make_saver("Builder · " if with_tester else ""),
-                                  max_steps=20 if with_tester else 15)
+                                  max_steps=20 if with_tester else 15, model=model)
+        agents = "AI agents" if with_tester else "An AI agent"
+        models = _model_note(model, *([tester] if tester else []), outcome)
 
         # The orchestrator's own verdict, from its own test run (not the agent's claim).
         verdict = _last_line(outcome["test_output"])
@@ -196,11 +218,11 @@ def run_agent_pipeline(project_id: UUID, session_factory, with_tester: bool = Fa
         ))
         if outcome["passed"]:
             project.status = "completed"
-            project.summary = (f"An AI agent ({agent.MODEL}) built {what} in {outcome['steps']} steps. "
+            project.summary = (f"{agents} ({models}) built {what} in {outcome['steps']} steps. "
                                f"Verified by our own test run: {verdict}. {requirements}")
         else:
             project.status = "failed"
-            project.summary = (f"The AI agent ({agent.MODEL}) did not get all tests passing: "
+            project.summary = (f"The developer agent ({models}) did not get all tests passing: "
                                f"{outcome['summary']}. Last test run: {verdict}. {requirements}")
         _touch(project)
         db.commit()
@@ -210,6 +232,8 @@ def run_agent_pipeline(project_id: UUID, session_factory, with_tester: bool = Fa
         db.rollback()
         _mark_failed(db, project_id)
     finally:
+        if holding_slot:
+            AGENT_SLOT.release()
         db.close()
         shutil.rmtree(workspace_root, ignore_errors=True)
 
@@ -221,6 +245,20 @@ def run_agent_team_pipeline(project_id: UUID, session_factory) -> None:
 
 def _count_tests(workspace: Path) -> int:
     return sum(f.read_text().count("\ndef test_") for f in (workspace / "tests").glob("test_*.py"))
+
+
+def _count_requirements(workspace: Path) -> int:
+    """Numbered lines in the tester's tests/REQUIREMENTS.md."""
+    path = workspace / "tests" / "REQUIREMENTS.md"
+    return len(re.findall(r"^\s*\d+[.)]", path.read_text(), re.MULTILINE)) if path.exists() else 0
+
+
+def _model_note(chosen: str, *outcomes) -> str:
+    """Which model did the work, and say so honestly if the fallback had to take over."""
+    used = sorted({o.get("model", chosen) for o in outcomes} - {chosen})
+    if not used:
+        return chosen
+    return f"{chosen}, with {', '.join(used)} taking over when it was overloaded"
 
 
 def _describe_step(event) -> tuple[str, str]:

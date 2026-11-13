@@ -21,12 +21,30 @@ from pathlib import Path
 from google import genai
 from google.genai import types
 
-MODEL = "gemini-3.5-flash-lite"
+try:  # Anula's model tiers from the v1 router, reused so both pipelines agree on what "cheap/strong" means
+    from .router import CHEAP_MODEL, MEDIUM_MODEL, STRONG_MODEL
+except ImportError:  # run as a script: python orchestrator/agent.py
+    from router import CHEAP_MODEL, MEDIUM_MODEL, STRONG_MODEL
+
+MODEL = MEDIUM_MODEL     # the default
+MAX_ATTEMPTS = 6               # model calls per step before the run gives up
+REQUEST_TIMEOUT_MS = 60_000  # one model call; past this, give up on it (and fall back, if not already on the fallback)
+FALLBACK_MODEL = MEDIUM_MODEL  # used when the chosen model keeps failing (e.g. the strong model returns 503)
+
+# The dashboard's Optimization setting -> which Gemini model the agents use.
+MODELS_BY_OPTIMIZATION = {"speed": CHEAP_MODEL, "balanced": MEDIUM_MODEL, "quality": STRONG_MODEL}
+
+
+def model_for(optimization):
+    """The model for an optimization setting ('speed', 'balanced', 'quality'); unknown settings get the default."""
+    return MODELS_BY_OPTIMIZATION.get(optimization, MODEL)
+
+
 TEMPLATE = Path(__file__).parent / "agent_template"  # the starter app + its tests (the requirements)
 
 SYSTEM_PROMPT = """You are the backend developer on a small team, working on a Python FastAPI project.
 Your job: make every test in tests/ pass.
-- Read the tests first: they are the requirements.
+- Read the tests first: they are the requirements. If tests/REQUIREMENTS.md exists, it explains them in plain English.
 - Never change anything in tests/.
 - Write real, general code. Never special-case the exact values the tests use.
 - Keep data in memory. Use only FastAPI, Pydantic and plain Python: no files, processes, network or environment access.
@@ -35,19 +53,39 @@ Your job: make every test in tests/ pass.
 START_MESSAGE = "Make the tests in tests/ pass."
 
 TESTER_PROMPT = """You are the tester on a small team. A product owner describes a backend; before any code exists,
-you write its requirements as pytest tests that a developer will then make pass.
-- Write ONE file: tests/test_app.py. You may only write files in tests/; never write app code.
-- The app will be a FastAPI app in app/main.py. Use `from fastapi.testclient import TestClient` and
-  `from app.main import app`, then `client = TestClient(app)`. Do not import anything else from app/.
-- Write 6 to 10 tests covering the main features: creating, listing and fetching the main resources,
-  one or two business rules from the description (for example totals or status changes), and 404/422 errors.
+you write its requirements as pytest tests that a developer will then make pass. You may only write files in tests/.
+
+Work in two steps.
+
+STEP 1: turn the request into a proper system. Requests are often vague ("a grocery store with transactions");
+your job is to expand them into what a real system of that kind needs. Write tests/REQUIREMENTS.md:
+- A numbered list of requirements, one per line, in plain English, most important first, 8 to 15 of them:
+  - the things to store, including the ones a real system of this kind needs even if the request didn't name
+    them (e.g. a store needs products with server-side prices and stock; a transaction references products)
+  - the actions on them (create, list, fetch, and domain actions like pay, refund, cancel)
+  - the business rules that make it correct (e.g. "the server computes totals from product prices",
+    "a purchase can't exceed stock", "a refund restores stock")
+  - errors: unknown ids return 404, invalid input returns 422
+- Then a section "## Assumptions" listing, one per line, what you added or decided that the request didn't say.
+Stay within the domain: no generic extras like a root or health endpoint.
+
+STEP 2: write tests/test_app.py with a separate test for each requirement. Put the requirement's number in the
+test's name: `def test_r3_order_reduces_stock():` covers requirement 3. A test may cover at most 2 requirements
+(e.g. `test_r4_r12_...`), so one failing check never hides another.
+- Use `from fastapi.testclient import TestClient`, `from app.main import app`, `client = TestClient(app)`.
+  The app will be a FastAPI app in app/main.py. Import nothing else from app/.
 - You decide the API: paths, JSON fields and status codes. Make it consistent and unambiguous; a developer
   will implement exactly what the tests demand, and nothing else.
+- Check behaviour, not just status codes: assert on the returned JSON fields and on what changed afterwards
+  (e.g. fetch the product again and check its stock went down; check a total is the exact expected number).
+- No weak checks: not `len(items) >= 1` or `isinstance(x, list)` on their own. Check that the exact item
+  you created is in the list, with the right values.
 - Data lives in memory. Tests must be independent: each test creates the data it needs, never assumes an id
   is a specific number, and uses unique names so tests can't clash. Use whole numbers for money (cents).
 - No randomness, dates or times, files, network, environment variables or other libraries.
-- When the file is written, run the tests: they should FAIL (nothing is built yet) but must load without errors.
-  Then reply with a short summary of the API you specified."""
+
+When both files are written, run the tests: they should FAIL (nothing is built yet) but must load without errors.
+Then reply with a short summary of the API you specified."""
 
 # Code that an in-memory web API never needs. Refused in anything either agent writes, because AI-written code
 # runs on the server. A speed bump against prompt injection, not a sandbox (that's Story #124).
@@ -62,7 +100,8 @@ FORBIDDEN = (
 
 def tester_message(description):
     """The tester's first message: the product owner's request. (The builder never sees it.)"""
-    return f"The product owner's request:\n\n{description}\n\nWrite the tests in tests/test_app.py."
+    return (f"The product owner's request:\n\n{description}\n\n"
+            "First list the requirements in tests/REQUIREMENTS.md, then write the tests in tests/test_app.py.")
 
 # ---- The tool menu: what the model reads to decide which tool to ask for ----
 
@@ -175,14 +214,53 @@ def builder_done(tools):
     return False, output, "Not done: the tests still fail. Here is the output:\n" + output
 
 
+def requirement_numbers(requirements_text):
+    """The numbered requirement lines ('3. ...' or '3) ...'), ignoring anything under an Assumptions heading."""
+    body = re.split(r"^#+\s*Assumptions", requirements_text, flags=re.MULTILINE | re.IGNORECASE)[0]
+    return re.findall(r"^\s*(\d+)[.)]", body, re.MULTILINE)
+
+
+def test_labels(tests_text):
+    """Each test function's name -> the requirement numbers in it: 'test_r1_r12_order' -> ['1', '12']."""
+    names = re.findall(r"^\s*def (test_\w+)", tests_text, re.MULTILINE)
+    return {name: re.findall(r"(?<![A-Za-z0-9])[rR](\d+)(?=_|$)", name) for name in names}
+
+
+def uncovered_requirements(requirements_text, tests_text):
+    """Requirement numbers that no test is named after. Only test names count, not comments."""
+    covered = {number for labels in test_labels(tests_text).values() for number in labels}
+    return [n for n in requirement_numbers(requirements_text) if n not in covered]
+
+
+def overloaded_tests(tests_text, limit=2):
+    """Tests named after more than `limit` requirements: one giant test hides which requirement failed."""
+    return [name for name, labels in test_labels(tests_text).items() if len(set(labels)) > limit]
+
+
 def tester_done(tools):
-    """Done when there are 3+ tests that load cleanly and FAIL on the empty starter app (so they test something)."""
+    """Done when: the tests load cleanly (3+ of them); tests/REQUIREMENTS.md lists the requirements and every one
+    has a test named after it; and the tests FAIL on the empty starter app (so they actually test something)."""
     collected = tools["collect_tests"]()
     summary = collected.strip().splitlines()[-1] if collected.strip() else ""
     match = re.search(r"(\d+) tests? collected", summary)
     if "error" in summary or not match or int(match.group(1)) < 3:
         return False, collected, ("Not done: tests/test_app.py must load without errors and contain at least "
                                   "3 tests. pytest says:\n" + collected)
+    try:
+        requirements = tools["read_file"]("tests/REQUIREMENTS.md")
+        tests = tools["read_file"]("tests/test_app.py")
+    except (FileNotFoundError, ValueError) as error:
+        return False, collected, f"Not done: write both tests/REQUIREMENTS.md and tests/test_app.py ({error})."
+    if not requirement_numbers(requirements):
+        return False, collected, "Not done: tests/REQUIREMENTS.md must list the requirements as numbered lines (1. ...)."
+    missing = uncovered_requirements(requirements, tests)
+    if missing:
+        return False, collected, (f"Not done: requirement(s) {', '.join(missing)} have no test. Add a separate "
+                                  f"test named after each, like test_r{missing[0]}_...")
+    crowded = overloaded_tests(tests)
+    if crowded:
+        return False, collected, (f"Not done: split {', '.join(crowded)} into separate tests. A test may cover at "
+                                  "most 2 requirements, so one failing check never hides another.")
     output = tools["run_tests"]()
     if tests_pass(output):
         return False, output, ("Not done: every test already passes on the empty starter app, so the tests "
@@ -198,7 +276,7 @@ def run_agent(workspace, on_step=None, model=MODEL, max_steps=15, system_prompt=
 
     on_step(event) is called after every tool call with
         {"step": int, "tool": str, "args": dict, "result": str}
-    Returns {"passed": bool, "steps": int, "summary": str, "test_output": str}.
+    Returns {"passed": bool, "steps": int, "summary": str, "test_output": str, "model": the model that finished}.
     """
     if role not in ("builder", "tester"):
         raise ValueError(f"unknown role: {role}")
@@ -207,7 +285,9 @@ def run_agent(workspace, on_step=None, model=MODEL, max_steps=15, system_prompt=
     start_message = start_message or START_MESSAGE
     done_check = tester_done if is_tester else builder_done
 
-    client = genai.Client()  # created here, not at import time, so importing this file never needs a key
+    # Created here, not at import time, so importing this file never needs a key. The timeout matters: without it,
+    # a model that never answers (seen with the strong model under load) hangs the run forever and no fallback starts.
+    client = genai.Client(http_options=types.HttpOptions(timeout=REQUEST_TIMEOUT_MS))
     tools = make_tools(workspace, role=role)
     config = types.GenerateContentConfig(
         system_instruction=system_prompt,
@@ -215,15 +295,28 @@ def run_agent(workspace, on_step=None, model=MODEL, max_steps=15, system_prompt=
         automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
     )
 
+    current = {"model": model}  # a dict so ask_model can change it (switch to the fallback model)
+
     def ask_model(history):
-        """Call Gemini, retrying a few times: under load it often answers 503 'overloaded'."""
-        for attempt in range(1, 5):
+        """Call Gemini, retrying when it fails. Two kinds of failure, handled differently:
+        - 429 RESOURCE_EXHAUSTED: the free tier's per-minute request limit. Waiting fixes it, so wait longer
+          (10s, 20s, 30s... about 2.5 minutes in total) before giving up.
+        - Anything else (503 overloaded, timeouts): short waits. And after 1 failure on a model other than the
+          fallback, switch to the fallback for the rest of the run (the strong model under load tends to keep
+          failing, and a demo cannot wait minutes)."""
+        for attempt in range(1, MAX_ATTEMPTS + 1):
             try:
-                return client.models.generate_content(model=model, contents=history, config=config)
+                return client.models.generate_content(model=current["model"], contents=history, config=config)
             except Exception as error:
-                print(f"   (Gemini error, retrying in {attempt * 3}s: {str(error)[:60]})")
-                time.sleep(attempt * 3)
-        raise RuntimeError("Gemini unavailable after 4 attempts")
+                rate_limited = "429" in str(error) or "RESOURCE_EXHAUSTED" in str(error)
+                wait = attempt * (10 if rate_limited else 3)
+                print(f"   (Gemini error on {current['model']}, retrying in {wait}s: {str(error)[:60]})")
+                if not rate_limited and current["model"] != FALLBACK_MODEL:
+                    print(f"   (switching to the fallback model {FALLBACK_MODEL})")
+                    current["model"] = FALLBACK_MODEL
+                if attempt < MAX_ATTEMPTS:
+                    time.sleep(wait)
+        raise RuntimeError(f"Gemini unavailable after {MAX_ATTEMPTS} attempts")
 
     history = [types.Content(role="user", parts=[types.Part(text=start_message)])]
 
@@ -236,7 +329,8 @@ def run_agent(workspace, on_step=None, model=MODEL, max_steps=15, system_prompt=
             # The model says it's finished. Don't take its word for it: check ourselves.
             done, output, feedback = done_check(tools)
             if done:
-                return {"passed": True, "steps": step, "summary": response.text or "", "test_output": output}
+                return {"passed": True, "steps": step, "summary": response.text or "", "test_output": output,
+                        "model": current["model"]}
             history.append(types.Content(role="user", parts=[types.Part(text=feedback)]))
             continue
 
@@ -255,7 +349,8 @@ def run_agent(workspace, on_step=None, model=MODEL, max_steps=15, system_prompt=
 
     # Out of steps. Check once more: the work may be done even though the agent never said so.
     done, output, _ = done_check(tools)
-    return {"passed": done, "steps": max_steps, "summary": "Stopped: hit the step limit", "test_output": output}
+    return {"passed": done, "steps": max_steps, "summary": "Stopped: hit the step limit", "test_output": output,
+            "model": current["model"]}
 
 
 # ---- Terminal version: python orchestrator/agent.py ----
