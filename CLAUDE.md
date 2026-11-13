@@ -54,6 +54,9 @@ backend/.venv/bin/python spike/agent_loop.py [model] [max_steps]
 - `ORCHESTRATOR=agent`: projects are built by the coding agent (`orchestrator/agent.py`, starter app + tests in
   `orchestrator/agent_template/`); each agent step becomes a task row, and `files` on the project shows the final code.
   Same risk as above (runs AI-written code via pytest): demo only until #124.
+- `ORCHESTRATOR=agent-team`: a tester agent (role `tester`) writes `tests/test_app.py` from the user's description,
+  then the builder makes it pass. User text steers server-run code here; `agent.FORBIDDEN` is only a speed bump.
+  Rehearse from the terminal: `backend/.venv/bin/python orchestrator/agent.py "a store with orders"`.
 
 Tests never call Gemini: `tests/conftest.py` removes these variables; tests that need an LLM pass in a fake one.
 

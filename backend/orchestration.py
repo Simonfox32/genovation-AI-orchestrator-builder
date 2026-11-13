@@ -113,44 +113,78 @@ def run_pipeline(project_id: UUID, session_factory) -> None:
         db.close()
 
 
-def run_agent_pipeline(project_id: UUID, session_factory) -> None:
+def run_agent_pipeline(project_id: UUID, session_factory, with_tester: bool = False) -> None:
     """Let the coding agent build the starter app; save every step as a task so the dashboard shows it live.
 
-    Safety: the user's description is stored but never given to the agent. The agent's code runs on this
-    server, so no user text may steer what it writes. Its instructions and requirements are fixed.
+    ORCHESTRATOR=agent (with_tester=False): the builder works against the built-in todo tests. The user's
+    description is stored but never given to an agent, so no user text steers code that runs on this server.
+
+    ORCHESTRATOR=agent-team (with_tester=True): a tester agent first writes tests from the user's description,
+    then the builder makes them pass. Here user text DOES steer code that runs on this server (the tests).
+    Demo window only; agent.FORBIDDEN refuses file/process/network/environment code as a speed bump.
+
     Never raises: failures mark the project as failed.
     """
-    
     db = session_factory()
     workspace_root = Path(tempfile.mkdtemp(prefix="agent-"))
-    
+
     try:
         project = db.get(Project, project_id)
         if project is None:
             logger.warning("Agent pipeline started for missing project %s", project_id)
             return
-        
+
         workspace = workspace_root / "workspace"
         shutil.copytree(agent.TEMPLATE, workspace, ignore=shutil.ignore_patterns("__pycache__"))  # no stale caches
-        test_count = sum(f.read_text().count("\ndef test_") for f in (workspace / "tests").glob("test_*.py"))
-        requirements = f"Requirements: the built-in todo API test suite ({test_count} tests)."
+        if with_tester:
+            for old_test in (workspace / "tests").glob("test_*.py"):
+                old_test.unlink()  # the tester writes the requirements instead
+            what = "your backend"
+            project.summary = (f"Two AI agents ({agent.MODEL}) are working: a tester is writing tests from your "
+                               "description; then a developer builds the backend until they pass.")
+        else:
+            what = "a todo API"
+            requirements = f"Requirements: the built-in todo API test suite ({_count_tests(workspace)} tests)."
+            project.summary = f"An AI agent ({agent.MODEL}) is building a todo API. {requirements}"
         project.status = "running"
-        project.summary = f"An AI agent ({agent.MODEL}) is building a todo API. {requirements}"
         _touch(project)
         db.commit()
-        
-        def save_step(event):
-            """Called by the agent after every tool call: one task row per step, committed right away."""
-            name, output = _describe_step(event)
-            project.tasks.append(Task(
-                id=uuid4(), position=len(project.tasks) + 1, name=name[:200],
-                description=f"Agent step {event['step']}", tool=event["tool"][:50],
-                status=_step_status(event), attempts=1, output=output,
-            ))
+
+        def make_saver(label="", tester=False):
+            """A callback for one agent: one task row per tool call, committed right away so the dashboard shows it."""
+            def save_step(event):
+                name, output = _describe_step(event)
+                project.tasks.append(Task(
+                    id=uuid4(), position=len(project.tasks) + 1, name=(label + name)[:200],
+                    description=f"Agent step {event['step']}", tool=event["tool"][:50],
+                    status=_step_status(event, tester=tester), attempts=1, output=output,
+                ))
+                _touch(project)
+                db.commit()
+            return save_step
+
+        if with_tester:
+            tester = agent.run_agent(workspace, on_step=make_saver("Tester · ", tester=True), role="tester",
+                                     start_message=agent.tester_message(project.description), max_steps=12)
+            if not tester["passed"]:
+                project.tasks.append(Task(
+                    id=uuid4(), position=len(project.tasks) + 1,
+                    name="The tester agent could not produce valid tests", description=tester["summary"],
+                    tool="pytest", status="failed", attempts=1, output=tester["test_output"][-2000:],
+                ))
+                project.status = "failed"
+                project.summary = ("The tester agent could not turn the description into valid tests "
+                                   f"({tester['summary']}). Try a more concrete description.")
+                _touch(project)
+                db.commit()
+                return
+            requirements = f"Requirements: {_count_tests(workspace)} tests written by the tester agent from your description."
+            project.summary = f"The tester wrote the requirements; a developer agent is now building {what}. {requirements}"
             _touch(project)
             db.commit()
-        
-        outcome = agent.run_agent(workspace, on_step=save_step)
+
+        outcome = agent.run_agent(workspace, on_step=make_saver("Builder · " if with_tester else ""),
+                                  max_steps=20 if with_tester else 15)
 
         # The orchestrator's own verdict, from its own test run (not the agent's claim).
         verdict = _last_line(outcome["test_output"])
@@ -162,7 +196,7 @@ def run_agent_pipeline(project_id: UUID, session_factory) -> None:
         ))
         if outcome["passed"]:
             project.status = "completed"
-            project.summary = (f"An AI agent ({agent.MODEL}) built a todo API in {outcome['steps']} steps. "
+            project.summary = (f"An AI agent ({agent.MODEL}) built {what} in {outcome['steps']} steps. "
                                f"Verified by our own test run: {verdict}. {requirements}")
         else:
             project.status = "failed"
@@ -179,8 +213,15 @@ def run_agent_pipeline(project_id: UUID, session_factory) -> None:
         db.close()
         shutil.rmtree(workspace_root, ignore_errors=True)
 
-    
-    pass
+
+def run_agent_team_pipeline(project_id: UUID, session_factory) -> None:
+    """ORCHESTRATOR=agent-team: a tester agent writes tests from the description, then the builder makes them pass."""
+    run_agent_pipeline(project_id, session_factory, with_tester=True)
+
+
+def _count_tests(workspace: Path) -> int:
+    return sum(f.read_text().count("\ndef test_") for f in (workspace / "tests").glob("test_*.py"))
+
 
 def _describe_step(event) -> tuple[str, str]:
     """A readable task name and output for one agent step."""
@@ -196,13 +237,17 @@ def _describe_step(event) -> tuple[str, str]:
     return tool, result[:2000]
 
 
-def _step_status(event) -> str:
-    """Red for refused or broken tool calls and for failing test runs; green otherwise."""
+def _step_status(event, tester: bool = False) -> str:
+    """Red for refused or broken tool calls and for failing test runs; green otherwise.
+    For the tester, failing tests are expected (nothing is built yet): only tests that don't load are red."""
     result = event["result"]
     if result.startswith(("ERROR", "REFUSED", "TIMEOUT")):
         return "failed"
-    if event["tool"] == "run_tests" and not agent.tests_pass(result):
-        return "failed"
+    if event["tool"] == "run_tests":
+        if tester:
+            return "failed" if "error" in _last_line(result) else "completed"
+        if not agent.tests_pass(result):
+            return "failed"
     return "completed"
 
 
@@ -211,9 +256,13 @@ def _last_line(text: str) -> str:
     return text.splitlines()[-1] if text else "(no output)"
 
 def get_pipeline():
-    """Dependency so tests can swap the pipeline out. ORCHESTRATOR=agent switches on the coding agent."""
-    if os.getenv("ORCHESTRATOR") == "agent":
+    """Dependency so tests can swap the pipeline out.
+    ORCHESTRATOR=agent: the coding agent with built-in tests. ORCHESTRATOR=agent-team: tester + builder agents."""
+    mode = os.getenv("ORCHESTRATOR")
+    if mode == "agent":
         return run_agent_pipeline
+    if mode == "agent-team":
+        return run_agent_team_pipeline
     return run_pipeline
 
 def _touch(project: Project) -> None:

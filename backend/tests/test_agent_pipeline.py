@@ -130,3 +130,72 @@ def test_workspace_is_deleted_afterwards(monkeypatch):
     submit()
 
     assert not calls[0]["workspace"].exists()
+
+
+# ---- ORCHESTRATOR=agent-team: a tester agent writes the tests, then the builder makes them pass ----
+
+TESTS = "from app.main import app\n\ndef test_one(): ...\n\ndef test_two(): ...\n"
+
+
+def fake_team(calls, tester_passes=True):
+    """Fake tester + builder. The tester really writes a test file, so the pipeline can count its tests."""
+    def run_agent(workspace, on_step=None, role="builder", start_message=None, **kwargs):
+        workspace = Path(workspace)
+        calls.append({"role": role, "start_message": start_message,
+                      "test_files": sorted(p.name for p in (workspace / "tests").glob("test_*.py"))})
+        if role == "tester":
+            (workspace / "tests" / "test_app.py").write_text(TESTS)
+            on_step({"step": 1, "tool": "write_file", "args": {"path": "tests/test_app.py", "content": TESTS},
+                     "result": "Wrote tests/test_app.py"})
+            on_step({"step": 2, "tool": "run_tests", "args": {}, "result": "...\n2 failed in 0.2s"})
+            return {"passed": tester_passes, "steps": 3, "summary": "done" if tester_passes else "Stopped: hit the step limit",
+                    "test_output": "2 failed in 0.2s" if tester_passes else "no tests collected, 1 error in 0.1s"}
+        on_step({"step": 1, "tool": "write_file", "args": {"path": "app/main.py", "content": CODE},
+                 "result": "Wrote app/main.py"})
+        return {"passed": True, "steps": 2, "summary": "done", "test_output": "2 passed in 0.2s"}
+    return run_agent
+
+
+def test_agent_team_switch(monkeypatch):
+    monkeypatch.setenv("ORCHESTRATOR", "agent-team")
+
+    assert orchestration.get_pipeline() is orchestration.run_agent_team_pipeline
+
+
+def test_team_tester_writes_tests_from_the_description_then_builder_passes_them(monkeypatch):
+    monkeypatch.setenv("ORCHESTRATOR", "agent-team")
+    calls = []
+    monkeypatch.setattr(orchestration.agent, "run_agent", fake_team(calls))
+
+    project = submit("A store with orders and transactions")
+
+    tester, builder = calls
+    assert tester["role"] == "tester" and builder["role"] == "builder"
+    assert tester["test_files"] == []  # the built-in todo tests were removed first
+    assert "A store with orders and transactions" in tester["start_message"]  # only the tester sees the request
+    assert builder["start_message"] is None
+    assert project["status"] == "completed"
+    assert "2 tests written by the tester agent" in project["summary"]
+    assert [t["name"] for t in project["tasks"]] == [
+        "Tester · Wrote tests/test_app.py",
+        "Tester · Ran the tests: 2 failed in 0.2s",
+        "Builder · Wrote app/main.py",
+        "Verified by the orchestrator: 2 passed in 0.2s",
+    ]
+    assert project["tasks"][1]["status"] == "completed"  # failing tests are expected while nothing is built
+    assert project["files"] == [
+        {"path": "tests/test_app.py", "description": "Tests written by the tester agent", "content": TESTS},
+        {"path": "app/main.py", "description": "Final version written by the AI agent", "content": CODE},
+    ]
+
+
+def test_team_stops_if_the_tester_cannot_write_valid_tests(monkeypatch):
+    monkeypatch.setenv("ORCHESTRATOR", "agent-team")
+    calls = []
+    monkeypatch.setattr(orchestration.agent, "run_agent", fake_team(calls, tester_passes=False))
+
+    project = submit("something vague")
+
+    assert [c["role"] for c in calls] == ["tester"]  # the builder never starts
+    assert project["status"] == "failed"
+    assert project["tasks"][-1]["name"] == "The tester agent could not produce valid tests"
