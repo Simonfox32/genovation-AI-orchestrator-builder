@@ -1,3 +1,4 @@
+import math
 import os
 
 # Model names for each tier. Copy the exact names from Google AI Studio if these don't match.
@@ -27,6 +28,9 @@ def build_code_prompt(module):
         "Write one Python function named " + module["function_name"] + ".\n"
         "What it should do: " + module["description"] + "\n"
         "It takes " + str(len(module["test_input"])) + " argument(s).\n"
+        # Show the exact check, so the model doesn't have to guess input shapes, rounding or edge cases.
+        "Example: " + module["function_name"] + "(*" + repr(module["test_input"]) + ") must return "
+        + repr(module["expected"]) + "\n"
         "Return ONLY the Python code, with no explanation."
     )
 
@@ -70,12 +74,24 @@ SETTINGS = {
     "quality": {"start": 2, "max_attempts": 1},
 }
 
+def matches(actual, expected):
+    """== but forgiving where JSON can't be exact: floats within 0.01, and tuples equal to lists."""
+    if isinstance(actual, bool) or isinstance(expected, bool):
+        return type(actual) is type(expected) and actual == expected  # in Python, 1 == True
+    if isinstance(actual, (int, float)) and isinstance(expected, (int, float)):
+        return math.isclose(actual, expected, abs_tol=0.01)
+    if isinstance(actual, (list, tuple)) and isinstance(expected, (list, tuple)):
+        return len(actual) == len(expected) and all(matches(a, e) for a, e in zip(actual, expected))
+    if isinstance(actual, dict) and isinstance(expected, dict):
+        return actual.keys() == expected.keys() and all(matches(actual[k], expected[k]) for k in expected)
+    return actual == expected
+
 def check(code, module):
     try:
         namespace = {}
         exec(code, namespace)
         func = namespace[module["function_name"]]
-        return func(*module["test_input"]) == module["expected"]
+        return matches(func(*module["test_input"]), module["expected"])
     except Exception:
         return False
 

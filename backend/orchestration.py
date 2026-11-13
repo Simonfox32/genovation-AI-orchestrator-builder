@@ -40,7 +40,11 @@ def get_llm():
     if not os.getenv("GEMINI_API_KEY"):
         return None
     from orchestrator.llm import call_llm
-    return call_llm
+
+    def plan_llm(prompt):
+        return call_llm(prompt, json_mode=True)  # the plan must be valid JSON
+
+    return plan_llm
 
 
 def describe_plan(used_llm: bool) -> str:
