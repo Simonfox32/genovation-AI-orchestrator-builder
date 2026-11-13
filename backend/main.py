@@ -78,6 +78,13 @@ class TaskResponse(BaseModel):
     output: str | None
 
 
+# One file the coding agent produced (matches the frontend's GeneratedFile type).
+class GeneratedFileResponse(BaseModel):
+    path: str
+    description: str | None = None
+    content: str | None = None
+
+
 # What the API sends back for a project.
 class ProjectResponse(BaseModel):
     id: UUID
@@ -88,6 +95,7 @@ class ProjectResponse(BaseModel):
     created_at: UTCDatetime
     updated_at: UTCDatetime
     tasks: list[TaskResponse]
+    files: list[GeneratedFileResponse] = []  # empty unless the coding agent (ORCHESTRATOR=agent) wrote files
 
 
 NOT_FOUND = {404: {"description": "Project not found"}}

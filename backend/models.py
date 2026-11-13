@@ -26,6 +26,20 @@ class Project(Base):
         passive_deletes=True,
     )
 
+    @property
+    def files(self) -> list[dict]:
+        """The files the coding agent wrote, latest version of each. Not a column: derived from the
+        agent's write_file task rows (named "Wrote <path>" by orchestration.py, code in `output`)."""
+        latest = {}
+        for task in self.tasks:  # ordered by position, so a later write of the same path replaces an earlier one
+            label, found, path = task.name.partition("Wrote ")  # names look like "Wrote app/main.py" or "Tester · Wrote ..."
+            if task.tool == "write_file" and found and task.output is not None:
+                by_tester = label.startswith("Tester")
+                latest[path] = ("Tests written by the tester agent" if by_tester
+                                else "Final version written by the AI agent", task.output)
+        return [{"path": path, "description": description, "content": content}
+                for path, (description, content) in latest.items()]
+
     __table_args__ = (
         CheckConstraint(
             "status IN ('pending', 'running', 'completed', 'failed')",
