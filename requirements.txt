@@ -9,3 +9,6 @@ psycopg[binary]==3.3.6
 python-dotenv==1.2.4
 alembic==1.20.1
 google-genai==3.3.0
+# The coding agent (ORCHESTRATOR=agent) runs its project's tests on the server, so these are runtime deps too.
+pytest==9.1.1
+httpx2==2.13.1

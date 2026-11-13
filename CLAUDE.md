@@ -8,8 +8,8 @@ Simon Fox is the backend & deployment lead and usually works here directly with 
 A user describes a product in plain English; the system plans it, hands the work to AI builders, checks the
 results and reports progress in a dashboard. Original vision: the "Unified Developer Blueprint" PDF (Simon has it).
 **Current direction (Nov 2026):** a role-based agent team. A lead orchestrator hands tasks to backend, frontend and tester
-agents that iterate on a real project until its tests pass. Working plan: `docs/agent-orchestrator-plan.md`
-(local, may be uncommitted); read its Decisions log before working on the orchestrator.
+agents that iterate on a real project until its tests pass. Work plan and milestones: `docs/plan.md`;
+design and decisions log: `docs/agent-orchestrator-plan.md` (both local, may be uncommitted). Read them before working on the orchestrator.
 
 ## Layout
 
@@ -51,7 +51,11 @@ backend/.venv/bin/python spike/agent_loop.py [model] [max_steps]
   **Risk:** `router.check()` runs generated code with `exec()` inside the API process, which holds secrets. Isolation is
   Sprint 5 story #124. Don't leave this on in public deployments without Simon's say-so.
 
-Tests never call Gemini: `tests/conftest.py` removes both variables; tests that need an LLM pass in a fake one.
+- `ORCHESTRATOR=agent`: projects are built by the coding agent (`orchestrator/agent.py`, starter app + tests in
+  `orchestrator/agent_template/`); each agent step becomes a task row, and `files` on the project shows the final code.
+  Same risk as above (runs AI-written code via pytest): demo only until #124.
+
+Tests never call Gemini: `tests/conftest.py` removes these variables; tests that need an LLM pass in a fake one.
 
 ## Deployment
 

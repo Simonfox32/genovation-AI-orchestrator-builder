@@ -15,6 +15,9 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID, uuid4
+import shutil
+import tempfile
+
 
 # orchestrator/ lives beside backend/, so put the repo root on the import path.
 # Revisit when deploying: the deployed service must include the orchestrator/ folder.
@@ -22,7 +25,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from orchestrator import decomposer, router  # noqa: E402  (must come after the sys.path change)
+from orchestrator import agent, decomposer, router  # noqa: E402  (must come after the sys.path change)
 
 from models import Project, Task  # noqa: E402
 
@@ -110,10 +113,108 @@ def run_pipeline(project_id: UUID, session_factory) -> None:
         db.close()
 
 
-def get_pipeline():
-    """Dependency so tests can swap the pipeline out."""
-    return run_pipeline
+def run_agent_pipeline(project_id: UUID, session_factory) -> None:
+    """Let the coding agent build the starter app; save every step as a task so the dashboard shows it live.
 
+    Safety: the user's description is stored but never given to the agent. The agent's code runs on this
+    server, so no user text may steer what it writes. Its instructions and requirements are fixed.
+    Never raises: failures mark the project as failed.
+    """
+    
+    db = session_factory()
+    workspace_root = Path(tempfile.mkdtemp(prefix="agent-"))
+    
+    try:
+        project = db.get(Project, project_id)
+        if project is None:
+            logger.warning("Agent pipeline started for missing project %s", project_id)
+            return
+        
+        workspace = workspace_root / "workspace"
+        shutil.copytree(agent.TEMPLATE, workspace, ignore=shutil.ignore_patterns("__pycache__"))  # no stale caches
+        test_count = sum(f.read_text().count("\ndef test_") for f in (workspace / "tests").glob("test_*.py"))
+        requirements = f"Requirements: the built-in todo API test suite ({test_count} tests)."
+        project.status = "running"
+        project.summary = f"An AI agent ({agent.MODEL}) is building a todo API. {requirements}"
+        _touch(project)
+        db.commit()
+        
+        def save_step(event):
+            """Called by the agent after every tool call: one task row per step, committed right away."""
+            name, output = _describe_step(event)
+            project.tasks.append(Task(
+                id=uuid4(), position=len(project.tasks) + 1, name=name[:200],
+                description=f"Agent step {event['step']}", tool=event["tool"][:50],
+                status=_step_status(event), attempts=1, output=output,
+            ))
+            _touch(project)
+            db.commit()
+        
+        outcome = agent.run_agent(workspace, on_step=save_step)
+
+        # The orchestrator's own verdict, from its own test run (not the agent's claim).
+        verdict = _last_line(outcome["test_output"])
+        project.tasks.append(Task(
+            id=uuid4(), position=len(project.tasks) + 1, name=f"Verified by the orchestrator: {verdict}"[:200],
+            description="Final test run by the orchestrator itself", tool="pytest",
+            status="completed" if outcome["passed"] else "failed", attempts=1,
+            output=outcome["test_output"][-2000:],
+        ))
+        if outcome["passed"]:
+            project.status = "completed"
+            project.summary = (f"An AI agent ({agent.MODEL}) built a todo API in {outcome['steps']} steps. "
+                               f"Verified by our own test run: {verdict}. {requirements}")
+        else:
+            project.status = "failed"
+            project.summary = (f"The AI agent ({agent.MODEL}) did not get all tests passing: "
+                               f"{outcome['summary']}. Last test run: {verdict}. {requirements}")
+        _touch(project)
+        db.commit()
+        
+    except Exception:
+        logger.exception("Agent pipeline failed for project %s", project_id)
+        db.rollback()
+        _mark_failed(db, project_id)
+    finally:
+        db.close()
+        shutil.rmtree(workspace_root, ignore_errors=True)
+
+    
+    pass
+
+def _describe_step(event) -> tuple[str, str]:
+    """A readable task name and output for one agent step."""
+    tool, args, result = event["tool"], event["args"], event["result"]
+    if tool == "write_file":
+        return f"Wrote {args.get('path', '?')}", args.get("content", "")
+    if tool == "read_file":
+        return f"Read {args.get('path', '?')}", result[:2000]
+    if tool == "list_files":
+        return "Listed the project files", result
+    if tool == "run_tests":
+        return f"Ran the tests: {_last_line(result)}", result[-2000:]
+    return tool, result[:2000]
+
+
+def _step_status(event) -> str:
+    """Red for refused or broken tool calls and for failing test runs; green otherwise."""
+    result = event["result"]
+    if result.startswith(("ERROR", "REFUSED", "TIMEOUT")):
+        return "failed"
+    if event["tool"] == "run_tests" and not agent.tests_pass(result):
+        return "failed"
+    return "completed"
+
+
+def _last_line(text: str) -> str:
+    text = text.strip()
+    return text.splitlines()[-1] if text else "(no output)"
+
+def get_pipeline():
+    """Dependency so tests can swap the pipeline out. ORCHESTRATOR=agent switches on the coding agent."""
+    if os.getenv("ORCHESTRATOR") == "agent":
+        return run_agent_pipeline
+    return run_pipeline
 
 def _touch(project: Project) -> None:
     project.updated_at = datetime.now(timezone.utc)
