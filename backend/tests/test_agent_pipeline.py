@@ -140,14 +140,16 @@ TESTS = "from app.main import app\n\ndef test_one(): ...\n\ndef test_two(): ...\
 
 
 def fake_team(calls, tester_passes=True):
-    """Fake tester + builder. The tester really writes a test file, so the pipeline can count its tests."""
-    def run_agent(workspace, on_step=None, role="builder", start_message=None, **kwargs):
-        workspace = Path(workspace)
+    """Fake tester + builder. Like the real agents, they work THROUGH the executor they're handed (never the disk
+    directly), and the tester really writes a test file so the pipeline can count its tests."""
+    def run_agent(workspace, on_step=None, role="builder", start_message=None, executor=None, **kwargs):
         calls.append({"role": role, "start_message": start_message, "model": kwargs.get("model"),
-                      "test_files": sorted(p.name for p in (workspace / "tests").glob("test_*.py"))})
+                      "executor": executor,
+                      "test_files": sorted(Path(p).name for p in executor.list_files("tests")
+                                           if Path(p).name.startswith("test_"))})
         if role == "tester":
-            (workspace / "tests" / "test_app.py").write_text(TESTS)
-            (workspace / "tests" / "REQUIREMENTS.md").write_text("1. Create orders\n2. List orders\n")
+            executor.write_file("tests/test_app.py", TESTS)
+            executor.write_file("tests/REQUIREMENTS.md", "1. Create orders\n2. List orders\n")
             on_step({"step": 1, "tool": "write_file", "args": {"path": "tests/test_app.py", "content": TESTS},
                      "result": "Wrote tests/test_app.py"})
             on_step({"step": 2, "tool": "run_tests", "args": {}, "result": "...\n2 failed in 0.2s"})
@@ -272,5 +274,87 @@ def test_the_slot_is_released_even_when_the_agent_crashes(monkeypatch):
 
     submit()
 
+    assert orchestration.AGENT_SLOT.acquire(blocking=False)
+    orchestration.AGENT_SLOT.release()
+
+
+# ---- EXECUTOR: where the agents' code runs ----
+
+class FakeSandbox:
+    """Stands in for SandboxExecutor (no Vercel calls): files in a dict; remembers whether it was closed."""
+    instances = []
+    python = "python"
+
+    def __init__(self):
+        self.files, self.closed = {}, False
+        FakeSandbox.instances.append(self)
+
+    def list_files(self, folder="."):
+        prefix = "" if folder in (".", "") else folder.rstrip("/") + "/"
+        return sorted(path for path in self.files if path.startswith(prefix))
+
+    def read_file(self, path):
+        return self.files[path]
+
+    def write_file(self, path, content):
+        self.files[path] = content
+
+    def run(self, command, timeout=60):
+        return 0, ""
+
+    def close(self):
+        self.closed = True
+
+
+@pytest.fixture
+def fake_sandbox(monkeypatch):
+    FakeSandbox.instances = []
+    monkeypatch.setenv("EXECUTOR", "vercel")
+    monkeypatch.setattr(orchestration, "SandboxExecutor", FakeSandbox)
+    return FakeSandbox
+
+
+def test_executor_setting_picks_where_code_runs(monkeypatch, tmp_path, fake_sandbox):
+    assert isinstance(orchestration.make_executor(tmp_path), FakeSandbox)
+
+    monkeypatch.delenv("EXECUTOR")
+
+    assert isinstance(orchestration.make_executor(tmp_path), orchestration.LocalExecutor)
+
+
+def test_team_shares_one_sandbox_seeded_with_the_starter_app(monkeypatch, fake_sandbox):
+    monkeypatch.setenv("ORCHESTRATOR", "agent-team")
+    calls = []
+    monkeypatch.setattr(orchestration.agent, "run_agent", fake_team(calls))
+
+    project = submit("A store with orders")
+
+    sandbox, = fake_sandbox.instances  # exactly one sandbox for the whole project
+    assert calls[0]["executor"] is sandbox and calls[1]["executor"] is sandbox
+    assert "app/main.py" in sandbox.files                   # the starter app went INTO the sandbox
+    assert "tests/test_todos.py" not in sandbox.files       # team mode: the built-in tests stayed out
+    assert "2 listed by the tester agent from your description, covered by 2 tests" in project["summary"]
+    assert sandbox.closed                                   # destroyed afterwards
+    assert project["status"] == "completed"
+
+
+def test_sandbox_is_destroyed_even_when_the_agent_crashes(monkeypatch, fake_sandbox):
+    def broken_agent(workspace, on_step=None, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(orchestration.agent, "run_agent", broken_agent)
+
+    project = submit()
+
+    assert project["status"] == "failed"
+    assert fake_sandbox.instances[0].closed
+
+
+def test_a_failing_close_does_not_break_the_pipeline(monkeypatch, fake_sandbox):
+    """Cleanup must not crash the rest of the cleanup: the one-at-a-time slot is still released."""
+    monkeypatch.setattr(FakeSandbox, "close", lambda self: (_ for _ in ()).throw(ConnectionError("network down")))
+    monkeypatch.setattr(orchestration.agent, "run_agent", fake_agent())
+
+    assert submit()["status"] == "completed"
     assert orchestration.AGENT_SLOT.acquire(blocking=False)
     orchestration.AGENT_SLOT.release()

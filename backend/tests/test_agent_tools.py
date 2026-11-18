@@ -5,6 +5,7 @@ import pytest
 
 import orchestration  # noqa: F401  (puts the repo root on the import path)
 from orchestrator import agent
+from orchestrator.executors import LocalExecutor
 
 
 @pytest.fixture
@@ -15,14 +16,64 @@ def workspace(tmp_path):
 
 
 def test_builder_may_not_write_tests_and_tester_may_not_write_the_app(workspace):
-    assert agent.make_tools(workspace, "builder")["write_file"]("tests/x.py", "x = 1").startswith("REFUSED")
-    assert agent.make_tools(workspace, "tester")["write_file"]("app/main.py", "x = 1").startswith("REFUSED")
-    assert agent.make_tools(workspace, "tester")["write_file"]("tests/test_app.py", "x = 1").startswith("Wrote")
+    assert agent.make_tools(LocalExecutor(workspace), "builder")["write_file"]("tests/x.py", "x = 1").startswith("REFUSED")
+    assert agent.make_tools(LocalExecutor(workspace), "tester")["write_file"]("app/main.py", "x = 1").startswith("REFUSED")
+    assert agent.make_tools(LocalExecutor(workspace), "tester")["write_file"]("tests/test_app.py", "x = 1").startswith("Wrote")
+
+
+def test_builder_cannot_reach_tests_through_an_absolute_path(workspace):
+    """The hole found during the executor refactor: an absolute path inside the workspace isn't 'tests/...' as text."""
+    target = workspace / "tests" / "test_todos.py"
+    original = target.read_text()
+
+    result = agent.make_tools(LocalExecutor(workspace), "builder")["write_file"](str(target), "x = 1")
+
+    assert result.startswith("REFUSED")
+    assert target.read_text() == original
+
+
+@pytest.mark.parametrize("path, inside", [
+    ("tests/test_app.py", True), ("./tests/test_app.py", True), ("app/../tests/test_app.py", True),
+    ("app/main.py", False), ("testsuite/x.py", False), ("tests/../app/main.py", False),
+])
+def test_in_folder_decides_from_the_path_text(path, inside):
+    assert agent.in_folder(path, "tests") is inside
+
+
+def test_tools_only_use_the_executor_interface():
+    """Any object with the four executor actions works: the tools never touch the disk themselves."""
+    class InMemoryExecutor:
+        python = "python"
+
+        def __init__(self):
+            self.files, self.commands = {}, []
+
+        def list_files(self, folder="."):
+            return sorted(self.files)
+
+        def read_file(self, path):
+            return self.files[path]
+
+        def write_file(self, path, content):
+            self.files[path] = content
+
+        def run(self, command, timeout=60):
+            self.commands.append(command)
+            return 1, "1 failed in 0.1s"
+
+    executor = InMemoryExecutor()
+    tools = agent.make_tools(executor, "builder")
+
+    assert tools["write_file"]("app/main.py", "x = 1").startswith("Wrote")
+    assert tools["list_files"]() == "app/main.py"
+    assert tools["read_file"]("app/main.py") == "x = 1"
+    assert tools["run_tests"]().endswith("1 failed in 0.1s")
+    assert executor.commands[0][:3] == ["python", "-m", "pytest"]
 
 
 def test_paths_outside_the_workspace_are_refused(workspace):
     with pytest.raises(ValueError):
-        agent.make_tools(workspace)["read_file"]("../../../etc/hosts")
+        agent.make_tools(LocalExecutor(workspace))["read_file"]("../../../etc/hosts")
 
 
 @pytest.mark.parametrize("code", [
@@ -33,13 +84,13 @@ def test_paths_outside_the_workspace_are_refused(workspace):
     "data = eval('1 + 1')",
 ])
 def test_guard_refuses_file_process_and_environment_code(workspace, code):
-    assert agent.make_tools(workspace)["write_file"]("app/main.py", code).startswith("REFUSED")
+    assert agent.make_tools(LocalExecutor(workspace))["write_file"]("app/main.py", code).startswith("REFUSED")
 
 
 def test_guard_allows_ordinary_store_code(workspace):
     code = 'ORDERS = {}\n\ndef order_retrieval(order_id):\n    return ORDERS[order_id]\n# POST /orders/{id}/process\n'
 
-    assert agent.make_tools(workspace)["write_file"]("app/main.py", code).startswith("Wrote")
+    assert agent.make_tools(LocalExecutor(workspace))["write_file"]("app/main.py", code).startswith("Wrote")
 
 
 def remove_builtin_tests(workspace):
@@ -50,11 +101,11 @@ def remove_builtin_tests(workspace):
 def test_tester_is_not_done_without_tests(workspace):
     remove_builtin_tests(workspace)
 
-    assert agent.tester_done(agent.make_tools(workspace, "tester"))[0] is False
+    assert agent.tester_done(agent.make_tools(LocalExecutor(workspace), "tester"))[0] is False
 
 
 def write_tester_files(workspace, requirements, tests):
-    tools = agent.make_tools(workspace, "tester")
+    tools = agent.make_tools(LocalExecutor(workspace), "tester")
     tools["write_file"]("tests/REQUIREMENTS.md", requirements)
     tools["write_file"]("tests/test_app.py", tests)
     return tools
@@ -86,7 +137,7 @@ def test_tester_is_not_done_when_tests_do_not_load(workspace):
 
 def test_tester_is_not_done_without_a_requirements_list(workspace):
     remove_builtin_tests(workspace)
-    tools = agent.make_tools(workspace, "tester")
+    tools = agent.make_tools(LocalExecutor(workspace), "tester")
     tools["write_file"]("tests/test_app.py", REAL_TESTS)
 
     done, _, feedback = agent.tester_done(tools)
@@ -170,7 +221,7 @@ def test_overloaded_model_falls_back_to_the_medium_model(workspace, monkeypatch)
 
 
 def test_builder_is_done_only_when_every_test_passes(workspace):
-    tools = agent.make_tools(workspace, "builder")
+    tools = agent.make_tools(LocalExecutor(workspace), "builder")
 
     done, output, feedback = agent.builder_done(tools)
 

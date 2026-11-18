@@ -17,9 +17,10 @@ design and decisions log: `docs/agent-orchestrator-plan.md` (both local, may be 
 |---|---|---|
 | `backend/` | Simon | FastAPI API, SQLAlchemy models, Alembic migrations, pytest suite |
 | `backend/orchestration.py` | Simon | The only backend file that imports orchestrator code: decompose → route → save tasks |
-| `orchestrator/` | Anula | `decomposer.py` (plan), `router.py` (model tiers + `check()`), `llm.py` (Gemini `call_llm`) |
+| `orchestrator/` | Anula (v1) | `decomposer.py` (plan), `router.py` (model tiers + `check()`), `llm.py` (Gemini `call_llm`) |
+| `orchestrator/agent.py`, `executors.py`, `agent_template/`, `sandbox/` | Simon + Claude | v2: the coding agents; executors decide WHERE code runs (local / Docker / Vercel Sandbox); the sandbox image recipes |
 | `frontend/` | Fill | React + TypeScript (Vite) form and dashboard; deployed on Vercel |
-| `spike/` | Simon + Claude | M0 agent-loop experiment (`agent_loop.py`, `template/`); `spike/runs/` is git-ignored output |
+| `spike/` | Simon | Learning scripts (`my_agent.py`, sandbox lessons); `spike/runs/` is git-ignored agent output |
 | `requirements.txt` (root) | | The real pinned Python deps (Railway installs from the root); `backend/requirements.txt` just points to it |
 
 The README's "Current Status" section is out of date: the decomposer and tools are now real when configured (below).
@@ -37,8 +38,13 @@ The README's "Current Status" section is out of date: the decomposer and tools a
 npm run dev        # http://localhost:5173, needs VITE_API_BASE_URL for the deployed API
 npm run build && npm run lint
 
-# agent spike (from repo root; LOCAL ONLY, runs AI-written code on this machine)
-backend/.venv/bin/python spike/agent_loop.py [model] [max_steps]
+# agents from the terminal (from repo root). EXECUTOR picks where the code runs: vercel / docker / (unset = local)
+EXECUTOR=vercel backend/.venv/bin/python orchestrator/agent.py                      # builder vs the built-in tests
+EXECUTOR=vercel backend/.venv/bin/python orchestrator/agent.py "a store with orders" # tester, then builder
+
+# sandbox images: rebuild after changing the sandbox's packages
+docker build -t ai-build-router-sandbox orchestrator/sandbox                 # for EXECUTOR=docker (needs Colima)
+backend/.venv/bin/python orchestrator/sandbox/build_vercel_snapshot.py       # prints a new VERCEL_SANDBOX_SNAPSHOT_ID
 ```
 
 ## Configuration (backend/.env, never committed)
@@ -53,11 +59,14 @@ backend/.venv/bin/python spike/agent_loop.py [model] [max_steps]
 
 - `ORCHESTRATOR=agent`: projects are built by the coding agent (`orchestrator/agent.py`, starter app + tests in
   `orchestrator/agent_template/`); each agent step becomes a task row, and `files` on the project shows the final code.
-  Same risk as above (runs AI-written code via pytest): demo only until #124.
 - `ORCHESTRATOR=agent-team`: a tester agent (role `tester`) writes `tests/test_app.py` from the user's description,
-  then the builder makes it pass. User text steers server-run code here; `agent.FORBIDDEN` is only a speed bump.
-  Rehearse from the terminal: `backend/.venv/bin/python orchestrator/agent.py "a store with orders"`.
-  The tester first writes `tests/REQUIREMENTS.md` (numbered); every requirement needs a `test_r<n>_...` test.
+  then the builder makes it pass. The tester first writes `tests/REQUIREMENTS.md` (numbered); every requirement
+  needs a `test_r<n>_...` test.
+- `EXECUTOR=vercel`: the agents' code runs in a Vercel Sandbox microVM (no secrets, no network), via
+  `SandboxExecutor`. **Required whenever an agent mode is on in a public deployment** (this is Story #124's fix).
+  Unset: `LocalExecutor`, which runs AI-written code on the server itself (local development only).
+  Needs `VERCEL_TOKEN`, `VERCEL_TEAM_ID`, `VERCEL_PROJECT_ID`, `VERCEL_SANDBOX_SNAPSHOT_ID` (see `.env.example`).
+  `agent.FORBIDDEN` stays as a second, weaker layer.
 - In agent modes the dashboard's Optimization picks the model for both agents (Anula's tiers in `router.py`):
   Fastest = cheap, Balanced = medium, Best Quality = strong. After 1 failure or 60s timeout the agent
   switches to the medium model for the rest of the run, and the summary says so.
