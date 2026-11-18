@@ -292,3 +292,12 @@ def test_database_template_gives_each_test_a_working_client(tmp_path):
     exit_code, output = executor.run([executor.python, "-m", "pytest", "-q", "-p", "no:cacheprovider"])
 
     assert exit_code == 0, output
+
+
+def test_database_template_explains_how_to_run_itself(tmp_path):
+    executor = LocalExecutor(tmp_path)
+    agent.seed_workspace(executor, include_tests=False, template=agent.TEMPLATE_DB)
+
+    assert "uvicorn app.main:app" in executor.read_file("README.md")
+    assert "sqlalchemy==2.1.6" in executor.read_file("requirements.txt")
+    assert agent.make_tools(executor, "builder")["write_file"]("requirements.txt", "requests").startswith("REFUSED")

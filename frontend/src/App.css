@@ -130,6 +130,8 @@ textarea:focus, select:focus {
 .results-header { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; }
 .refresh-btn { padding: 9px 14px; background: #312366; color: #ffffff; border: none; border-radius: 7px; cursor: pointer; }
 .refresh-btn:hover { background: #24194d; }
+.download-btn { display: inline-block; margin: 0 0 12px; padding: 9px 14px; background: #312366; color: #ffffff; border-radius: 7px; text-decoration: none; }
+.download-btn:hover { background: #24194d; }
 .failed { background: #fee2e2; color: #991b1b; }
 .error-message { background: #fee2e2; color: #991b1b; padding: 16px; border-radius: 8px; margin-bottom: 20px; }
 .output-box details { margin-bottom: 12px; }

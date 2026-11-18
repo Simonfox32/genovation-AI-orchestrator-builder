@@ -1,0 +1,6 @@
+# The exact versions this project was built and tested with (in the AI Build Router sandbox).
+fastapi==0.143.3
+uvicorn[standard]==0.54.0
+sqlalchemy==2.1.6
+pytest==9.1.1
+httpx2==2.13.1

@@ -372,3 +372,52 @@ def test_team_builder_gets_the_database_instructions(monkeypatch):
     tester, builder = calls
     assert builder["system_prompt"] == orchestration.agent.BUILDER_DB_PROMPT
     assert tester["system_prompt"] is None  # the tester uses its own default prompt
+
+
+# ---- Downloading the generated project as a zip ----
+
+def zip_names(response):
+    import io
+    import zipfile
+    return sorted(zipfile.ZipFile(io.BytesIO(response.content)).namelist())
+
+
+def test_team_project_saves_every_file_and_downloads_as_a_zip(monkeypatch):
+    monkeypatch.setenv("ORCHESTRATOR", "agent-team")
+    monkeypatch.setattr(orchestration.agent, "run_agent", fake_team([]))
+
+    project = submit("A store with orders")
+    response = client.get(f"/projects/{project['id']}/download")
+
+    assert project["downloadable"] is True
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/zip"
+    folder = f"ai-build-router-{project['id'][:8]}"
+    assert f'filename="{folder}.zip"' in response.headers["content-disposition"]
+    names = zip_names(response)
+    for path in ("README.md", "requirements.txt", "app/db.py", "app/main.py", "tests/conftest.py",
+                 "tests/test_app.py", "tests/REQUIREMENTS.md"):   # template files AND the agents' files
+        assert f"{folder}/{path}" in names
+
+
+def test_download_is_404_for_unknown_projects_and_projects_without_files(monkeypatch):
+    monkeypatch.delenv("ORCHESTRATOR")   # v1 pipeline: no agent files
+    v1 = submit()
+
+    assert v1["downloadable"] is False
+    assert client.get(f"/projects/{v1['id']}/download").status_code == 404
+    assert client.get("/projects/00000000-0000-0000-0000-000000000000/download").status_code == 404
+
+
+def test_download_never_lets_a_path_escape_the_folder(monkeypatch, db_session):
+    """'Zip slip': an AI-written path like ../../evil.py must not end up outside the folder when unzipped."""
+    from models import Project
+    monkeypatch.delenv("ORCHESTRATOR")
+    project_id = submit()["id"]
+    project = db_session.get(Project, UUID(project_id))
+    project.artifact = {"app/main.py": "ok", "../../evil.py": "x", "/etc/evil.py": "x", "app/../../evil.py": "x"}
+    db_session.commit()
+
+    names = zip_names(client.get(f"/projects/{project_id}/download"))
+
+    assert names == [f"ai-build-router-{project_id[:8]}/app/main.py"]

@@ -45,7 +45,8 @@ TEMPLATE_DB = Path(__file__).parent / "agent_template_db"  # FastAPI + SQLite/SQ
 
 # The database template's plumbing. Agents may read these files but never change them: getting them subtly wrong
 # breaks every test (see the C1c experiment: foreign keys off, or no StaticPool).
-PROTECTED = {"app/db.py", "tests/conftest.py"}
+# requirements.txt lists what the sandbox can actually run: the sandbox has no network to install anything else.
+PROTECTED = {"app/db.py", "tests/conftest.py", "requirements.txt"}
 
 SYSTEM_PROMPT = """You are the backend developer on a small team, working on a Python FastAPI project.
 Your job: make every test in tests/ pass.
@@ -76,8 +77,8 @@ database through SQLAlchemy 2. Your job: make every test in tests/ pass.
 - Split the code sensibly: models in app/models.py, request/response shapes (Pydantic) in app/schemas.py,
   endpoints in app/main.py.
 - Write real, general code. Never special-case the exact values the tests use.
-- Use only FastAPI, Pydantic, SQLAlchemy and the Python standard library: no files, processes, network or
-  environment access.
+- Use only FastAPI, Pydantic, SQLAlchemy and the Python standard library (requirements.txt lists what's installed;
+  don't change it): no files, processes, network or environment access.
 - Run the tests after every change, and fix what fails. You're done only when all tests pass."""
 
 TESTER_PROMPT = """You are the tester on a small team. A product owner describes a backend; before any code exists,

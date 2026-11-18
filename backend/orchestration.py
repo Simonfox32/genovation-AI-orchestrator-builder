@@ -209,6 +209,7 @@ def run_agent_pipeline(project_id: UUID, session_factory, with_tester: bool = Fa
                 project.status = "failed"
                 project.summary = ("The tester agent could not turn the description into valid tests "
                                    f"({tester['summary']}). Try a more concrete description.")
+                project.artifact = _collect_files(executor)  # downloadable even when it failed
                 _touch(project)
                 db.commit()
                 return
@@ -240,6 +241,8 @@ def run_agent_pipeline(project_id: UUID, session_factory, with_tester: bool = Fa
             project.status = "failed"
             project.summary = (f"The developer agent ({models}) did not get all tests passing: "
                                f"{outcome['summary']}. Last test run: {verdict}. {requirements}")
+        # Save every file now: the sandbox (and everything in it) is destroyed when the run ends.
+        project.artifact = _collect_files(executor)
         _touch(project)
         db.commit()
         
@@ -262,6 +265,23 @@ def run_agent_pipeline(project_id: UUID, session_factory, with_tester: bool = Fa
 def run_agent_team_pipeline(project_id: UUID, session_factory) -> None:
     """ORCHESTRATOR=agent-team: a tester agent writes tests from the description, then the builder makes them pass."""
     run_agent_pipeline(project_id, session_factory, with_tester=True)
+
+
+def _collect_files(executor) -> dict:
+    """Every text file of the generated project, {path: content}, read through the executor.
+
+    Skips database files and caches (binary or regenerated). A file that can't be read as text is skipped rather
+    than failing the whole save.
+    """
+    files = {}
+    for path in executor.list_files():
+        if path.endswith(agent.DATABASE_FILES) or "__pycache__" in path.split("/"):
+            continue
+        try:
+            files[path] = executor.read_file(path)
+        except Exception:
+            logger.warning("Could not read %s for the project download", path)
+    return files
 
 
 def _count_tests(executor) -> int:
