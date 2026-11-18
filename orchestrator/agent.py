@@ -67,8 +67,13 @@ database through SQLAlchemy 2. Your job: make every test in tests/ pass.
   `Mapped[...]` and `mapped_column(...)`. Let the database enforce rules where it can:
   - ForeignKey(..., ondelete="CASCADE") where deleting a parent must delete its children. If you also define a
     relationship() on the parent, give it cascade="all, delete-orphan", passive_deletes=True.
-  - unique=True or UniqueConstraint(...) for "no duplicates" rules; check before inserting (or catch
-    IntegrityError and roll back) so a duplicate returns 409, not a crash.
+  - unique=True or UniqueConstraint(...) for "no duplicates" rules. Query for the duplicate before inserting and
+    return 409 only when you found one. Never turn every IntegrityError into 409: a missing parent row raises one
+    too, and would then be reported as a "duplicate".
+- Anything that points at another row (a project_id on a task, a faction_id on a character) must be looked up
+  before you create or change it: if that row doesn't exist, return 404 "<Thing> not found" and save nothing.
+- Error messages must say what actually went wrong. People will also use this API by hand through its /docs page,
+  so the cases the tests don't show must behave just as sensibly as the ones they do.
 - Validate input in the Pydantic schemas: Field(min_length=1) does NOT reject "   ", so strip blank text in a
   field_validator; Literal[...] for fixed sets of values; Field(ge=0) for numbers that can't be negative.
 - Endpoints get a database session ONLY through `db: Session = Depends(get_db)` (get_db from app.db). Never create
@@ -101,6 +106,9 @@ your job is to expand them into what a real system of that kind needs. Write tes
     anything else with 422
   - NO DUPLICATES, as its own requirement wherever something must be unique (e.g. the same member twice in one
     workspace): the duplicate is rejected with 409
+  - MISSING PARENTS, as its own requirement wherever one thing points at another: creating or moving a child
+    under a parent id that doesn't exist (e.g. a task in project 999) returns 404 and creates nothing. This must
+    NOT come back as 409: it isn't a duplicate
   - the domain actions (like pay, refund, cancel)
   - the business rules that make it correct (e.g. "the server computes totals from product prices",
     "a purchase can't exceed stock", "a refund restores stock")
@@ -113,7 +121,7 @@ your job is to expand them into what a real system of that kind needs. Write tes
         may only move todo -> doing -> done: new things must start in their first state)
       - one user's data never showing up in another user's results
       - a rejected request changes nothing (stock and totals stay as they were)
-  - errors: unknown ids return 404, invalid input returns 422, duplicates return 409
+  - errors: unknown ids return 404 (in the URL or in the request body), invalid input returns 422, duplicates return 409
 - Then a section "## Assumptions" listing, one per line, what you added or decided that the request didn't say.
 Stay within the domain: no generic extras like a root or health endpoint.
 

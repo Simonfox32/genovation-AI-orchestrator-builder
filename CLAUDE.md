@@ -11,6 +11,11 @@ results and reports progress in a dashboard. Original vision: the "Unified Devel
 agents that iterate on a real project until its tests pass. Work plan and milestones: `docs/plan.md`;
 design and decisions log: `docs/agent-orchestrator-plan.md` (both local, may be uncommitted). Read them before working on the orchestrator.
 
+**Status (2026-11-18), live on Railway:** in `ORCHESTRATOR=agent-team` mode, a tester agent writes numbered requirements
+and tests, then a builder makes a FastAPI + SQLite/SQLAlchemy backend pass them. The agents' code runs in a Vercel Sandbox, and the result downloads as a
+runnable zip. Not built yet: a planner, tester↔builder feedback rounds, and a frontend agent. Progress log and what's next: `docs/plan.md` §5b.
+Our v2 agents (`orchestrator/agent.py`) supersede Anula's v1 pipeline. Leave her open PR #11 unmerged: it removes `json_mode`, which v1 needs.
+
 ## Layout
 
 | Path | Owner | What |
@@ -67,7 +72,11 @@ backend/.venv/bin/python orchestrator/sandbox/build_vercel_snapshot.py       # p
   `BUILDER_DB_PROMPT` (models / schemas / main, foreign keys with ON DELETE CASCADE, sessions only via `get_db`);
   tests use the `client` fixture, a fresh in-memory database per test. `app/db.py` and `tests/conftest.py` are
   `PROTECTED` (SQLite gotchas: foreign keys must be switched on per connection; in-memory tests need `StaticPool`).
-  The sandbox image/snapshot must include `sqlalchemy`; rebuild and update `VERCEL_SANDBOX_SNAPSHOT_ID` after changing it.
+  The template's `requirements.txt` is `PROTECTED` too. It pins the exact versions in the sandbox image and snapshot (keep the three in sync).
+  The template's `README.md` explains how to run a downloaded project.
+- **Download:** when an agent run ends, the whole workspace is saved in `projects.artifact` (JSON `{path: text}`, skipping
+  `.db` files and `__pycache__`) before the sandbox is destroyed. `GET /projects/{id}/download` serves it as a zip
+  (paths that would escape the folder are skipped: "zip slip"). `downloadable` in the API shows the dashboard's download button.
 - `EXECUTOR=vercel`: the agents' code runs in a Vercel Sandbox microVM (no secrets, no network), via
   `SandboxExecutor`. **Required whenever an agent mode is on in a public deployment** (this is Story #124's fix).
   Unset: `LocalExecutor`, which runs AI-written code on the server itself (local development only).
@@ -105,3 +114,13 @@ Tests never call Gemini: `tests/conftest.py` removes these variables; tests that
 - Gemini models often return 503/504 under load: retry with backoff.
 - FastAPI route order: `/todos/stats` must be declared before `/todos/{id}`.
 - Railpack builds from the repo root: Python version in `.python-version`, deps in the root `requirements.txt`.
+- Changing the sandbox's packages, in this order:
+  1. Rebuild the snapshot.
+  2. Put the new `VERCEL_SANDBOX_SNAPSHOT_ID` in `backend/.env` **and** Railway (Simon sets Railway), before merging code that needs it.
+  3. Delete the old snapshot only after Railway is verified on the new one.
+
+  The snapshot script calls `destroy()` instead of using `with`, because the context exit can delete snapshots.
+- `DockerExecutor` (Colima) only sees folders under your home directory. Other folders, such as macOS temp folders, appear
+  empty inside the container without any error, so it refuses workspaces outside home.
+- Local agent testing in the browser pane: `.claude/launch.json` has `backend-agents` (team mode + Vercel Sandbox) and
+  `frontend-local` (points the dashboard at localhost:8000 instead of Railway).
