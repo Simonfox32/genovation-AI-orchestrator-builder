@@ -66,7 +66,10 @@ database through SQLAlchemy 2. Your job: make every test in tests/ pass.
   `Mapped[...]` and `mapped_column(...)`. Let the database enforce rules where it can:
   - ForeignKey(..., ondelete="CASCADE") where deleting a parent must delete its children. If you also define a
     relationship() on the parent, give it cascade="all, delete-orphan", passive_deletes=True.
-  - unique=True or UniqueConstraint(...) for "no duplicates" rules.
+  - unique=True or UniqueConstraint(...) for "no duplicates" rules; check before inserting (or catch
+    IntegrityError and roll back) so a duplicate returns 409, not a crash.
+- Validate input in the Pydantic schemas: Field(min_length=1) does NOT reject "   ", so strip blank text in a
+  field_validator; Literal[...] for fixed sets of values; Field(ge=0) for numbers that can't be negative.
 - Endpoints get a database session ONLY through `db: Session = Depends(get_db)` (get_db from app.db). Never create
   sessions or engines yourself: the tests swap get_db for a fresh test database.
 - Keep `from app import models`, `Base.metadata.create_all(engine)` and `app = FastAPI()` in app/main.py.
@@ -84,10 +87,20 @@ Work in two steps.
 
 STEP 1: turn the request into a proper system. Requests are often vague ("a grocery store with transactions");
 your job is to expand them into what a real system of that kind needs. Write tests/REQUIREMENTS.md:
-- A numbered list of requirements, one per line, in plain English, most important first, 10 to 18 of them:
+- A numbered list of requirements, one per line, in plain English, most important first, 12 to 22 of them:
   - the things to store, including the ones a real system of this kind needs even if the request didn't name
     them (e.g. a store needs products with server-side prices and stock; a transaction references products)
-  - the actions on them (create, list, fetch, and domain actions like pay, refund, cancel)
+  - the BASICS, for every kind of thing stored, so they are never missing. One requirement per kind of thing,
+    e.g. "3. Tasks can be created in a project, fetched by id, listed per project, and reassigned":
+      - create it, fetch one by id, and list them, including listing children through their parent
+        (e.g. a project's tasks, a task's comments, a workspace's members)
+      - change every field the request implies can change (e.g. reassigning a task), and delete where it makes sense
+  - VALIDATION, as its own requirements: required text fields reject empty or blank values ("" and "   ") with 422;
+    numbers that can't be negative reject negatives with 422; values from a fixed set (like a status) reject
+    anything else with 422
+  - NO DUPLICATES, as its own requirement wherever something must be unique (e.g. the same member twice in one
+    workspace): the duplicate is rejected with 409
+  - the domain actions (like pay, refund, cancel)
   - the business rules that make it correct (e.g. "the server computes totals from product prices",
     "a purchase can't exceed stock", "a refund restores stock")
   - the edge cases of those rules, each as its OWN numbered requirement, because bugs hide there. Think like
@@ -95,9 +108,11 @@ your job is to expand them into what a real system of that kind needs. Write tes
       - the same item twice in one request (e.g. 3 + 3 of a product with stock 5 must be rejected, as 6 > 5)
       - exact boundaries (buying exactly the remaining stock succeeds; one more fails)
       - doing an action twice (refunding twice), or in the wrong state (refunding a cancelled order)
+      - getting around a rule through a different endpoint (e.g. CREATING a task directly as "done" when status
+        may only move todo -> doing -> done: new things must start in their first state)
       - one user's data never showing up in another user's results
       - a rejected request changes nothing (stock and totals stay as they were)
-  - errors: unknown ids return 404, invalid input returns 422
+  - errors: unknown ids return 404, invalid input returns 422, duplicates return 409
 - Then a section "## Assumptions" listing, one per line, what you added or decided that the request didn't say.
 Stay within the domain: no generic extras like a root or health endpoint.
 

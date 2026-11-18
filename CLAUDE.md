@@ -61,7 +61,9 @@ backend/.venv/bin/python orchestrator/sandbox/build_vercel_snapshot.py       # p
   `orchestrator/agent_template/`); each agent step becomes a task row, and `files` on the project shows the final code.
 - `ORCHESTRATOR=agent-team`: a tester agent (role `tester`) writes `tests/test_app.py` from the user's description,
   then the builder makes it pass. The tester first writes `tests/REQUIREMENTS.md` (numbered); every requirement
-  needs a `test_r<n>_...` test. Projects start from `agent_template_db/` (SQLite + SQLAlchemy): the builder uses
+  needs a `test_r<n>_...` test. The tester's checklist makes the basics explicit for every kind of thing stored
+  (create / fetch / list incl. children / update / delete), blank text -> 422, duplicates -> 409, plus edge cases such
+  as getting around a rule through another endpoint. Projects start from `agent_template_db/` (SQLite + SQLAlchemy): the builder uses
   `BUILDER_DB_PROMPT` (models / schemas / main, foreign keys with ON DELETE CASCADE, sessions only via `get_db`);
   tests use the `client` fixture, a fresh in-memory database per test. `app/db.py` and `tests/conftest.py` are
   `PROTECTED` (SQLite gotchas: foreign keys must be switched on per connection; in-memory tests need `StaticPool`).
