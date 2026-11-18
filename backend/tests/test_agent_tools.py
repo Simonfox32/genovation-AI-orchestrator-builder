@@ -304,6 +304,16 @@ def test_database_template_explains_how_to_run_itself(tmp_path):
     assert agent.make_tools(executor, "builder")["write_file"]("requirements.txt", "requests").startswith("REFUSED")
 
 
+def test_prompts_cover_missing_parents():
+    # Nov 18 bug: creating a character in a faction that doesn't exist came back as 409 "already exists". The builder
+    # turned EVERY IntegrityError into 409 (a missing parent raises one too), and no test tried a missing parent,
+    # so every test passed. These rules close both gaps; keep them.
+    assert "MISSING PARENTS" in agent.TESTER_PROMPT
+    assert "Never turn every IntegrityError into 409" in agent.BUILDER_DB_PROMPT
+    assert "must be looked up" in agent.BUILDER_DB_PROMPT
+    assert "or catch\n    IntegrityError" not in agent.BUILDER_DB_PROMPT  # the old shortcut
+
+
 def test_database_template_readme_commands_are_safe_to_paste():
     # People copy these boxes straight into a terminal. One command per box, so copying a box never brings along
     # a half-run sequence; and no "# comment", because zsh (the macOS default) passes a typed # on as an argument.
