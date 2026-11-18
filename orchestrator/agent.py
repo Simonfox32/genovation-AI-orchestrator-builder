@@ -11,8 +11,6 @@ Used two ways:
 """
 import os
 import re
-import shutil
-import subprocess
 import sys
 import time
 from datetime import datetime
@@ -23,8 +21,10 @@ from google.genai import types
 
 try:  # Anula's model tiers from the v1 router, reused so both pipelines agree on what "cheap/strong" means
     from .router import CHEAP_MODEL, MEDIUM_MODEL, STRONG_MODEL
+    from .executors import DockerExecutor, LocalExecutor, SandboxExecutor
 except ImportError:  # run as a script: python orchestrator/agent.py
     from router import CHEAP_MODEL, MEDIUM_MODEL, STRONG_MODEL
+    from executors import DockerExecutor, LocalExecutor, SandboxExecutor
 
 MODEL = MEDIUM_MODEL     # the default
 MAX_ATTEMPTS = 6               # model calls per step before the run gives up
@@ -142,32 +142,25 @@ TOOL_MENU = [list_files_tool, read_file_tool, write_file_tool, run_tests_tool]
 
 
 # ---- The real tools: plain Python, fenced to one workspace ----
+def in_folder(path, folder):
+    """Is the relative `path` inside `folder`? Decided from the text alone (no disk), so it works for any executor."""
+    parts = Path(os.path.normpath(path)).parts
+    return len(parts) > 0 and parts[0] == folder
 
-def make_tools(workspace, role="builder"):
-    """Build the tools for ONE workspace and role. Each run gets its own set, fenced to its own folder."""
-    # Resolve once, so every path uses the same spelling. (On macOS the temp folder /var/... is a link
-    # to /private/var/...; mixing the two made relative_to() fail.)
-    workspace = Path(workspace).resolve()
 
-    def safe_path(path):
-        """Turn the model's path into a real path, refusing anything outside the workspace."""
-        full = (workspace / path).resolve()  # resolve() turns "a/../../b" into the real location
-        if not full.is_relative_to(workspace.resolve()):
-            raise ValueError(f"{path} is outside the project")
-        return full
+def make_tools(executor, role="builder"):
+    """Build the agent's tools for one role. The RULES live here; the executor does the actual work, wherever it runs."""
 
     def list_files(folder="."):
-        root = safe_path(folder)
-        files = [str(p.relative_to(workspace)) for p in sorted(root.rglob("*"))
-                 if p.is_file() and "__pycache__" not in p.parts]
-        return "\n".join(files) or "(no files)"
+        return "\n".join(executor.list_files(folder)) or "(no files)"
 
     def read_file(path):
-        return safe_path(path).read_text()
+        return executor.read_file(path)
 
     def write_file(path, content):
-        full = safe_path(path)
-        in_tests = full.is_relative_to((workspace / "tests").resolve())
+        if os.path.isabs(path):
+            return "REFUSED: use a path relative to the project, like app/main.py."
+        in_tests = in_folder(path, "tests")
         if role == "builder" and in_tests:
             return "REFUSED: tests/ holds the requirements. Change the app code instead."
         if role == "tester" and not in_tests:
@@ -176,22 +169,14 @@ def make_tools(workspace, role="builder"):
         if blocked:
             return (f"REFUSED: this project may not use {', '.join(blocked)}. Keep to FastAPI, Pydantic and "
                     "plain Python data structures: no files, processes, network or environment access.")
-        full.parent.mkdir(parents=True, exist_ok=True)
-        full.write_text(content)
+        executor.write_file(path, content)
         return f"Wrote {path} ({len(content)} characters)"
 
     def pytest(*extra):
-        # Our own environment holds the Gemini key (and on Railway, the database URL). Child processes
-        # inherit it, so the tests run with a stripped-down environment instead.
-        env = {"PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", "")}
-        try:
-            result = subprocess.run(
-                [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *extra],  # the Python running us
-                cwd=workspace, env=env, capture_output=True, text=True, timeout=60,
-            )
-        except subprocess.TimeoutExpired:
+        exit_code, output = executor.run([executor.python, "-m", "pytest", "-q", "-p", "no:cacheprovider", *extra],
+                                         timeout=60)
+        if exit_code is None:  # the executor stopped it: it ran too long
             return "TIMEOUT: the tests took longer than 60 seconds."
-        output = result.stdout + result.stderr
         return output[-4000:]  # the end has the failures and the summary; keeps what we send small
 
     def run_tests():
@@ -204,6 +189,18 @@ def make_tools(workspace, role="builder"):
     return {"list_files": list_files, "read_file": read_file, "write_file": write_file, "run_tests": run_tests,
             "collect_tests": collect_tests}
 
+def seed_workspace(executor, include_tests=True):
+    """Put the starter app (and the built-in tests, unless the tester will write its own) into the workspace.
+
+    Goes through the executor, so it works wherever the workspace lives: a local folder or a remote sandbox.
+    """
+    for source in sorted(TEMPLATE.rglob("*")):
+        if not source.is_file() or "__pycache__" in source.parts:
+            continue
+        relative = source.relative_to(TEMPLATE).as_posix()  # e.g. "app/main.py"
+        if not include_tests and relative.startswith("tests/"):
+            continue
+        executor.write_file(relative, source.read_text())
 
 def tests_pass(output):
     """pytest's last line is the summary, e.g. '10 passed in 0.3s' or '2 failed, 8 passed in 0.4s'."""
@@ -278,7 +275,7 @@ def tester_done(tools):
 # ---- The agent loop ----
 
 def run_agent(workspace, on_step=None, model=MODEL, max_steps=15, system_prompt=None,
-              role="builder", start_message=None):
+              role="builder", start_message=None, executor=None):
     """Run one agent (role "builder" or "tester") in `workspace` until its done-check passes or `max_steps` runs out.
 
     on_step(event) is called after every tool call with
@@ -295,7 +292,10 @@ def run_agent(workspace, on_step=None, model=MODEL, max_steps=15, system_prompt=
     # Created here, not at import time, so importing this file never needs a key. The timeout matters: without it,
     # a model that never answers (seen with the strong model under load) hangs the run forever and no fallback starts.
     client = genai.Client(http_options=types.HttpOptions(timeout=REQUEST_TIMEOUT_MS))
-    tools = make_tools(workspace, role=role)
+
+    executor = executor or LocalExecutor(workspace)  # where the work happens; local unless told otherwise
+    tools = make_tools(executor, role=role)
+    
     config = types.GenerateContentConfig(
         system_instruction=system_prompt,
         tools=[types.Tool(function_declarations=TOOL_MENU)],
@@ -369,30 +369,45 @@ def print_step(event):
     last_line = result.splitlines()[-1][:80] if result else ""
     print(f"Step {event['step']}: {event['tool']}({shown}) -> {last_line}")
 
-
 if __name__ == "__main__":
     from dotenv import load_dotenv
 
     repo = Path(__file__).parent.parent
     load_dotenv(repo / "backend" / ".env")
     workspace = repo / "spike" / "runs" / datetime.now().strftime("%Y%m%d-%H%M%S") / "workspace"
-    shutil.copytree(TEMPLATE, workspace, ignore=shutil.ignore_patterns("__pycache__"))
-    print("Workspace:", workspace)
+    description = " ".join(sys.argv[1:])
+
+    # EXECUTOR picks WHERE the code runs: "vercel" (remote microVM), "docker" (local container), else this machine.
+    choice = os.getenv("EXECUTOR", "local")
+    if choice == "vercel":
+        executor = SandboxExecutor()
+    elif choice == "docker":
+        executor = DockerExecutor(workspace)
+    else:
+        executor = LocalExecutor(workspace)
+    print("Executor:", type(executor).__name__)
     started = time.time()
 
-    description = " ".join(sys.argv[1:])
-    if description:  # team mode: the tester writes the tests first, replacing the built-in ones
-        for old_test in (workspace / "tests").glob("test_*.py"):
-            old_test.unlink()
-        print("\n=== Tester ===")
-        tester = run_agent(workspace, on_step=print_step, role="tester",
-                           start_message=tester_message(description), max_steps=12)
-        print(f"Tester {'done' if tester['passed'] else 'FAILED'}: {tester['test_output'].strip().splitlines()[-1]}")
-        if not tester["passed"]:
-            sys.exit(1)
-        print("\n=== Builder ===")
+    with executor:  # a Vercel sandbox is destroyed when this block ends, even after an error
+        seed_workspace(executor, include_tests=not description)  # team mode: the tester writes the tests
 
-    outcome = run_agent(workspace, on_step=print_step, max_steps=20 if description else 15)
+        if description:
+            print("\n=== Tester ===")
+            tester = run_agent(workspace, on_step=print_step, role="tester",
+                               start_message=tester_message(description), max_steps=12, executor=executor)
+            print(f"Tester {'done' if tester['passed'] else 'FAILED'}: {tester['test_output'].strip().splitlines()[-1]}")
+            if not tester["passed"]:
+                sys.exit(1)
+            print("\n=== Builder ===")
+
+        outcome = run_agent(workspace, on_step=print_step, max_steps=20 if description else 15, executor=executor)
+
+        # Keep a local copy of the result: a Vercel sandbox (and its files) disappears when the block ends.
+        for path in executor.list_files():
+            local = workspace / path
+            local.parent.mkdir(parents=True, exist_ok=True)
+            local.write_text(executor.read_file(path))
+
     verdict = "DONE, verified" if outcome["passed"] else "NOT DONE"
     print(f"\n{verdict} after {outcome['steps']} steps: {outcome['test_output'].strip().splitlines()[-1]}")
     print(f"Time: {time.time() - started:.0f}s    Code: {workspace / 'app' / 'main.py'}")

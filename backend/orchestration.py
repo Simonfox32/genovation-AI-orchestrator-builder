@@ -9,7 +9,6 @@ What is real depends on configuration:
                            simulated tools that return hard-coded code.
 """
 import logging
-import re
 import os
 import sys
 import time
@@ -28,6 +27,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from orchestrator import agent, decomposer, router  # noqa: E402  (must come after the sys.path change)
+from orchestrator.executors import LocalExecutor, SandboxExecutor  # noqa: E402
 
 from models import Project, Task  # noqa: E402
 
@@ -119,6 +119,17 @@ def run_pipeline(project_id: UUID, session_factory) -> None:
         db.close()
 
 
+def make_executor(workspace: Path):
+    """WHERE the agents' code runs, picked by EXECUTOR.
+
+    "vercel": a Vercel Sandbox microVM with no secrets and no network. The only safe choice on a public server.
+    anything else: this machine. Fine for local development and tests, but NOT a sandbox.
+    """
+    if os.getenv("EXECUTOR") == "vercel":
+        return SandboxExecutor()
+    return LocalExecutor(workspace)
+
+
 def run_agent_pipeline(project_id: UUID, session_factory, with_tester: bool = False) -> None:
     """Let the coding agent build the starter app; save every step as a task so the dashboard shows it live.
 
@@ -126,14 +137,17 @@ def run_agent_pipeline(project_id: UUID, session_factory, with_tester: bool = Fa
     description is stored but never given to an agent, so no user text steers code that runs on this server.
 
     ORCHESTRATOR=agent-team (with_tester=True): a tester agent first writes tests from the user's description,
-    then the builder makes them pass. Here user text DOES steer code that runs on this server (the tests).
-    Demo window only; agent.FORBIDDEN refuses file/process/network/environment code as a speed bump.
+    then the builder makes them pass. Here user text DOES steer the code that gets run.
+
+    Where that code runs is make_executor's choice: with EXECUTOR=vercel it runs in a Vercel Sandbox microVM
+    (no secrets, no network), the only safe setting for a public server. Without it, it runs on this machine.
 
     Never raises: failures mark the project as failed.
     """
     db = session_factory()
     workspace_root = Path(tempfile.mkdtemp(prefix="agent-"))
     holding_slot = False
+    executor = None
 
     try:
         project = db.get(Project, project_id)
@@ -150,19 +164,18 @@ def run_agent_pipeline(project_id: UUID, session_factory, with_tester: bool = Fa
             AGENT_SLOT.acquire()  # wait our turn
         holding_slot = True
 
-        workspace = workspace_root / "workspace"
-        shutil.copytree(agent.TEMPLATE, workspace, ignore=shutil.ignore_patterns("__pycache__"))  # no stale caches
+        workspace = workspace_root / "workspace"  # only used by the local executor
         model = agent.model_for(project.optimization)  # Fastest / Balanced / Best Quality -> cheap / medium / strong
         tester = None
+        executor = make_executor(workspace)
+        agent.seed_workspace(executor, include_tests=not with_tester)  # the tester writes its own tests
         if with_tester:
-            for old_test in (workspace / "tests").glob("test_*.py"):
-                old_test.unlink()  # the tester writes the requirements instead
             what = "your backend"
             project.summary = (f"Two AI agents ({model}) are working: a tester is writing tests from your "
                                "description; then a developer builds the backend until they pass.")
         else:
             what = "a todo API"
-            requirements = f"Requirements: the built-in todo API test suite ({_count_tests(workspace)} tests)."
+            requirements = f"Requirements: the built-in todo API test suite ({_count_tests(executor)} tests)."
             project.summary = f"An AI agent ({model}) is building a todo API. {requirements}"
         project.status = "running"
         _touch(project)
@@ -184,7 +197,7 @@ def run_agent_pipeline(project_id: UUID, session_factory, with_tester: bool = Fa
         if with_tester:
             tester = agent.run_agent(workspace, on_step=make_saver("Tester · ", tester=True), role="tester",
                                      start_message=agent.tester_message(project.description), max_steps=12,
-                                     model=model)
+                                     model=model, executor=executor)
             if not tester["passed"]:
                 project.tasks.append(Task(
                     id=uuid4(), position=len(project.tasks) + 1,
@@ -197,14 +210,14 @@ def run_agent_pipeline(project_id: UUID, session_factory, with_tester: bool = Fa
                 _touch(project)
                 db.commit()
                 return
-            requirements = (f"Requirements: {_count_requirements(workspace)} listed by the tester agent from your "
-                            f"description, covered by {_count_tests(workspace)} tests.")
+            requirements = (f"Requirements: {_count_requirements(executor)} listed by the tester agent from your "
+                            f"description, covered by {_count_tests(executor)} tests.")
             project.summary = f"The tester wrote the requirements; a developer agent is now building {what}. {requirements}"
             _touch(project)
             db.commit()
 
         outcome = agent.run_agent(workspace, on_step=make_saver("Builder · " if with_tester else ""),
-                                  max_steps=20 if with_tester else 15, model=model)
+                                  max_steps=20 if with_tester else 15, model=model, executor=executor)
         agents = "AI agents" if with_tester else "An AI agent"
         models = _model_note(model, *([tester] if tester else []), outcome)
 
@@ -232,6 +245,11 @@ def run_agent_pipeline(project_id: UUID, session_factory, with_tester: bool = Fa
         db.rollback()
         _mark_failed(db, project_id)
     finally:
+        if executor is not None:
+            try:
+                executor.close()  # destroys the Vercel sandbox; does nothing for the local executor
+            except Exception:
+                logger.exception("Could not close the executor for project %s", project_id)
         if holding_slot:
             AGENT_SLOT.release()
         db.close()
@@ -243,14 +261,17 @@ def run_agent_team_pipeline(project_id: UUID, session_factory) -> None:
     run_agent_pipeline(project_id, session_factory, with_tester=True)
 
 
-def _count_tests(workspace: Path) -> int:
-    return sum(f.read_text().count("\ndef test_") for f in (workspace / "tests").glob("test_*.py"))
+def _count_tests(executor) -> int:
+    """How many test functions the tests/test_*.py files contain, read through the executor."""
+    return sum(executor.read_file(path).count("\ndef test_") for path in executor.list_files("tests")
+               if Path(path).name.startswith("test_") and path.endswith(".py"))
 
 
-def _count_requirements(workspace: Path) -> int:
-    """Numbered lines in the tester's tests/REQUIREMENTS.md."""
-    path = workspace / "tests" / "REQUIREMENTS.md"
-    return len(re.findall(r"^\s*\d+[.)]", path.read_text(), re.MULTILINE)) if path.exists() else 0
+def _count_requirements(executor) -> int:
+    """Numbered requirement lines in the tester's tests/REQUIREMENTS.md, read through the executor."""
+    if "tests/REQUIREMENTS.md" not in executor.list_files("tests"):
+        return 0
+    return len(agent.requirement_numbers(executor.read_file("tests/REQUIREMENTS.md")))
 
 
 def _model_note(chosen: str, *outcomes) -> str:

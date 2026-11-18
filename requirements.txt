@@ -12,3 +12,5 @@ google-genai==3.3.0
 # The coding agent (ORCHESTRATOR=agent) runs its project's tests on the server, so these are runtime deps too.
 pytest==9.1.1
 httpx2==2.13.1
+# EXECUTOR=vercel runs the agents' code in a Vercel Sandbox microVM (orchestrator/executors.py SandboxExecutor).
+vercel-sandbox==1.0.0
