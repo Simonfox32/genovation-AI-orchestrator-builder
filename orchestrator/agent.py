@@ -31,6 +31,13 @@ MAX_ATTEMPTS = 6               # model calls per step before the run gives up
 REQUEST_TIMEOUT_MS = 60_000  # one model call; past this, give up on it (and fall back, if not already on the fallback)
 FALLBACK_MODEL = MEDIUM_MODEL  # used when the chosen model keeps failing (e.g. the strong model returns 503)
 
+# The feedback loop (team mode). Seen 11-18: a builder spent 5 rounds on a test that contradicted the requirements,
+# then broke 3 passing tests trying to satisfy it. So: stop a stuck builder early, and get the tests checked.
+STUCK_AFTER = 3     # builder test runs in a row without fewer failures than its best so far -> stop it
+REVIEW_ROUNDS = 2   # times the tester re-checks the failing tests and the builder tries again
+REVIEW_STEPS = 10   # steps for one tester review (a real one, replaying 11-18's run, used 8: read, read, fix, test, fix)
+RETRY_STEPS = 15    # steps for each extra builder round (a fresh history, so it starts fast again)
+
 # The dashboard's Optimization setting -> which Gemini model the agents use.
 MODELS_BY_OPTIMIZATION = {"speed": CHEAP_MODEL, "balanced": MEDIUM_MODEL, "quality": STRONG_MODEL}
 
@@ -84,7 +91,11 @@ database through SQLAlchemy 2. Your job: make every test in tests/ pass.
 - Write real, general code. Never special-case the exact values the tests use.
 - Use only FastAPI, Pydantic, SQLAlchemy and the Python standard library (requirements.txt lists what's installed;
   don't change it): no files, processes, network or environment access.
-- Run the tests after every change, and fix what fails. You're done only when all tests pass."""
+- Run the tests after every change, and fix what fails. You're done only when all tests pass.
+- Tests are written by a person, and can be wrong. If a test can't pass without breaking a numbered requirement or
+  another test (e.g. it expects a purchase that requirement 8 says must be refused), don't bend the app to fit it:
+  call report_test_problem with the test's name and the contradiction. A tester will check it. Never use it just
+  because a test is hard: only for a real contradiction or a wrong expected value."""
 
 TESTER_PROMPT = """You are the tester on a small team. A product owner describes a backend; before any code exists,
 you write its requirements as pytest tests that a developer will then make pass. You may only write files in tests/.
@@ -159,6 +170,44 @@ def tester_message(description):
     return (f"The product owner's request:\n\n{description}\n\n"
             "First list the requirements in tests/REQUIREMENTS.md, then write the tests in tests/test_app.py.")
 
+
+REVIEWER_PROMPT = """You are the tester on a small team. Earlier you wrote tests/REQUIREMENTS.md (numbered
+requirements) and tests/test_app.py (a test per requirement). A developer then built the app in app/, but could not
+make some tests pass. Your job now: decide, for each of those tests, whether the TEST is wrong or the CODE is.
+
+A test is wrong when it contradicts a numbered requirement or another test, expects a value that doesn't follow from
+the requirements (check the arithmetic step by step), or relies on something no requirement says. Example: a test
+buys a 300-credit ship with 200 credits and expects the purchase to go through, while requirement 8 says a purchase
+the character can't afford is refused.
+
+- Read tests/REQUIREMENTS.md and the failing tests. Read app/ too if it helps you see what the code does.
+- If a test is wrong: fix it in tests/test_app.py (and fix REQUIREMENTS.md if the requirement itself was unclear).
+  Keep its name (test_r<n>_...) and keep it checking its requirement: correct the mistake, never delete the check
+  or weaken it until anything passes.
+- If a test is right: change nothing. The code is wrong.
+- Touch only the tests you were asked about. Run the tests when you're done.
+- Finish with your verdict in one or two sentences: for each test, "fixed: <what was wrong>" or "correct: <what the
+  code gets wrong>". The developer reads your verdict next."""
+
+
+def review_message(failing, test_output, dispute=None):
+    """The tester's message for a review: which tests failed, the developer's complaint (if any), the evidence."""
+    lines = [f"The developer could not make these tests pass: {', '.join(failing)}."]
+    if dispute:
+        lines.append(f"The developer says {dispute['test']} is wrong: \"{dispute['reason']}\"")
+    lines.append(f"The latest test output:\n{test_output[-3000:]}")
+    lines.append("Check each of these tests against tests/REQUIREMENTS.md and the other tests, then give your verdict.")
+    return "\n\n".join(lines)
+
+
+def retry_message(failing, verdict, tests_changed):
+    """The builder's first message in an extra round: what the tester decided about the tests it was stuck on."""
+    change = ("The tester corrected the tests: read tests/test_app.py again." if tests_changed
+              else "The tester says the tests are right, so the code must change.")
+    return (f"You worked on this project before, but these tests kept failing: {', '.join(failing)}.\n"
+            f"{change} The tester's verdict: {verdict or '(none given)'}\n\n"
+            "The files are as you left them. Read what you need, then make every test pass.")
+
 # ---- The tool menu: what the model reads to decide which tool to ask for ----
 
 list_files_tool = types.FunctionDeclaration(
@@ -187,7 +236,17 @@ run_tests_tool = types.FunctionDeclaration(
     description="Run the test suite with pytest and return its output: failures and the summary.",
     parameters_json_schema={"type": "object", "properties": {}},
 )
+report_test_problem_tool = types.FunctionDeclaration(
+    name="report_test_problem",
+    description=("Report a test that can't pass without breaking a numbered requirement or another test, or whose "
+                 "expected value is wrong. This ends your turn: a tester checks the test, then you continue."),
+    parameters_json_schema={"type": "object", "properties": {
+        "test": {"type": "string", "description": "The failing test's function name, e.g. 'test_r10_dispatch'."},
+        "reason": {"type": "string", "description": "The contradiction, citing requirement numbers."}},
+        "required": ["test", "reason"]},
+)
 TOOL_MENU = [list_files_tool, read_file_tool, write_file_tool, run_tests_tool]
+REVIEWABLE_TOOL_MENU = TOOL_MENU + [report_test_problem_tool]  # a builder whose tests a tester can re-check (team mode)
 
 
 # ---- The real tools: plain Python, fenced to one workspace ----
@@ -243,8 +302,18 @@ def make_tools(executor, role="builder"):
         """Load the tests without running them: catches broken test files. Used by our checks, not the model."""
         return pytest("--collect-only")
 
-    return {"list_files": list_files, "read_file": read_file, "write_file": write_file, "run_tests": run_tests,
-            "collect_tests": collect_tests}
+    def report_test_problem(test, reason=""):
+        # Only a test that fails right now can be reported; otherwise "report it" is an easy way out of the work.
+        name = str(test).split("::")[-1].strip()
+        if name not in failing_tests(run_tests()):
+            return f"REFUSED: {name} isn't failing right now, so there is nothing to report. Keep working."
+        return f"REPORTED: {name}"
+
+    tools = {"list_files": list_files, "read_file": read_file, "write_file": write_file, "run_tests": run_tests,
+             "collect_tests": collect_tests}
+    if role == "builder":
+        tools["report_test_problem"] = report_test_problem
+    return tools
 
 def seed_workspace(executor, include_tests=True, template=TEMPLATE):
     """Put a starter template into the workspace: its app files, its test setup (conftest.py), and its built-in
@@ -264,6 +333,32 @@ def tests_pass(output):
     """pytest's last line is the summary, e.g. '10 passed in 0.3s' or '2 failed, 8 passed in 0.4s'."""
     summary = output.strip().splitlines()[-1] if output.strip() else ""
     return "passed" in summary and "failed" not in summary and "error" not in summary
+
+
+def failing_tests(output):
+    """The names of the failing tests in pytest's output: 'FAILED tests/test_app.py::test_r3_x - assert ...' ->
+    {'test_r3_x'}. A file that doesn't even load ('ERROR tests/test_app.py') names no test, so it isn't counted."""
+    return set(re.findall(r"^(?:FAILED|ERROR) \S+::(\w+)", output, re.MULTILINE))
+
+
+class ProgressWatch:
+    """Notices a builder going round in circles: `limit` test runs in a row without fewer failing tests than its best
+    so far. Runs where nothing loads (a syntax error) don't count either way: that's a typo, not being stuck."""
+
+    def __init__(self, limit=STUCK_AFTER):
+        self.limit, self.best, self.flat, self.suspects = limit, None, 0, set()
+
+    def record(self, output):
+        """Feed one test run's output. True when the builder is stuck."""
+        failing = failing_tests(output)
+        if not failing:
+            return False
+        if self.best is None or len(failing) < self.best:
+            self.best, self.flat, self.suspects = len(failing), 0, set(failing)  # progress: start counting again
+            return False
+        self.flat += 1
+        self.suspects = (self.suspects & failing) or failing  # the tests that failed every time, if there are any
+        return self.flat >= self.limit
 
 
 # ---- "Done" checks: our code decides when a role is finished, not the model ----
@@ -299,15 +394,22 @@ def overloaded_tests(tests_text, limit=2):
     return [name for name, labels in test_labels(tests_text).items() if len(set(labels)) > limit]
 
 
-def tester_done(tools):
-    """Done when: the tests load cleanly (3+ of them); tests/REQUIREMENTS.md lists the requirements and every one
-    has a test named after it; and the tests FAIL on the empty starter app (so they actually test something)."""
-    collected = tools["collect_tests"]()
+def collected_count(collected):
+    """How many tests `pytest --collect-only` found, or None if they didn't load."""
     summary = collected.strip().splitlines()[-1] if collected.strip() else ""
     match = re.search(r"(\d+) tests? collected", summary)
-    if "error" in summary or not match or int(match.group(1)) < 3:
-        return False, collected, ("Not done: tests/test_app.py must load without errors and contain at least "
-                                  "3 tests. pytest says:\n" + collected)
+    return None if "error" in summary or not match else int(match.group(1))
+
+
+def tests_are_sound(tools, min_tests=3):
+    """The shape every tester's work must keep: the tests load cleanly (at least `min_tests` of them);
+    tests/REQUIREMENTS.md lists the requirements; every one has a test named after it; no test covers more than 2.
+    Returns (ok, output, message for the agent if not ok)."""
+    collected = tools["collect_tests"]()
+    count = collected_count(collected)
+    if count is None or count < min_tests:
+        return False, collected, (f"Not done: tests/test_app.py must load without errors and contain at least "
+                                  f"{min_tests} tests. pytest says:\n" + collected)
     try:
         requirements = tools["read_file"]("tests/REQUIREMENTS.md")
         tests = tools["read_file"]("tests/test_app.py")
@@ -323,6 +425,15 @@ def tester_done(tools):
     if crowded:
         return False, collected, (f"Not done: split {', '.join(crowded)} into separate tests. A test may cover at "
                                   "most 2 requirements, so one failing check never hides another.")
+    return True, collected, ""
+
+
+def tester_done(tools):
+    """Done when the tests are sound (see tests_are_sound) and they FAIL on the empty starter app, so they actually
+    test something."""
+    sound, output, feedback = tests_are_sound(tools)
+    if not sound:
+        return False, output, feedback
     output = tools["run_tests"]()
     if tests_pass(output):
         return False, output, ("Not done: every test already passes on the empty starter app, so the tests "
@@ -330,22 +441,35 @@ def tester_done(tools):
     return True, output, ""
 
 
+def review_done(tools, min_tests):
+    """A review is done when the tests are still sound and none were removed: fixing a wrong test must never mean
+    deleting it. (The app now exists, so unlike tester_done the tests may pass.)"""
+    return tests_are_sound(tools, min_tests=min_tests)
+
+
 # ---- The agent loop ----
 
 def run_agent(workspace, on_step=None, model=MODEL, max_steps=15, system_prompt=None,
-              role="builder", start_message=None, executor=None):
+              role="builder", start_message=None, executor=None, reviewable=False, done_check=None):
     """Run one agent (role "builder" or "tester") in `workspace` until its done-check passes or `max_steps` runs out.
 
     on_step(event) is called after every tool call with
         {"step": int, "tool": str, "args": dict, "result": str}
-    Returns {"passed": bool, "steps": int, "summary": str, "test_output": str, "model": the model that finished}.
+    reviewable=True (a builder in team mode, where a tester can re-check the tests): the builder may call
+    report_test_problem, and is stopped early when it stops making progress (see ProgressWatch).
+    done_check(tools) -> (done, output, feedback) replaces the role's usual check (a tester's review uses this).
+    Returns {"passed": bool, "steps": int, "summary": str, "test_output": str, "model": the model that finished},
+    plus "stuck": [test names] if it was stopped for making no progress, or "disputed": {"test", "reason"} if it
+    reported a test.
     """
     if role not in ("builder", "tester"):
         raise ValueError(f"unknown role: {role}")
     is_tester = role == "tester"
     system_prompt = system_prompt or (TESTER_PROMPT if is_tester else SYSTEM_PROMPT)
     start_message = start_message or START_MESSAGE
-    done_check = tester_done if is_tester else builder_done
+    done_check = done_check or (tester_done if is_tester else builder_done)
+    reviewable = reviewable and not is_tester
+    watch = ProgressWatch() if reviewable else None
 
     # Created here, not at import time, so importing this file never needs a key. The timeout matters: without it,
     # a model that never answers (seen with the strong model under load) hangs the run forever and no fallback starts.
@@ -356,7 +480,7 @@ def run_agent(workspace, on_step=None, model=MODEL, max_steps=15, system_prompt=
     
     config = types.GenerateContentConfig(
         system_instruction=system_prompt,
-        tools=[types.Tool(function_declarations=TOOL_MENU)],
+        tools=[types.Tool(function_declarations=REVIEWABLE_TOOL_MENU if reviewable else TOOL_MENU)],
         automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
     )
 
@@ -385,6 +509,15 @@ def run_agent(workspace, on_step=None, model=MODEL, max_steps=15, system_prompt=
 
     history = [types.Content(role="user", parts=[types.Part(text=start_message)])]
 
+    def stopped(step, output, summary, **extra):
+        return {"passed": False, "steps": step, "summary": summary, "test_output": output,
+                "model": current["model"], **extra}
+
+    def stuck(step, output):
+        names = sorted(watch.suspects)
+        return stopped(step, output, f"Stopped: no progress in {watch.limit} test runs, still failing "
+                                     f"{', '.join(names)}", stuck=names)
+
     for step in range(1, max_steps + 1):
         response = ask_model(history)
         history.append(response.candidates[0].content)
@@ -396,6 +529,8 @@ def run_agent(workspace, on_step=None, model=MODEL, max_steps=15, system_prompt=
             if done:
                 return {"passed": True, "steps": step, "summary": response.text or "", "test_output": output,
                         "model": current["model"]}
+            if watch and watch.record(output):
+                return stuck(step, output)
             history.append(types.Content(role="user", parts=[types.Part(text=feedback)]))
             continue
 
@@ -408,6 +543,12 @@ def run_agent(workspace, on_step=None, model=MODEL, max_steps=15, system_prompt=
                 result = f"ERROR: {type(error).__name__}: {error}"
             if on_step:
                 on_step({"step": step, "tool": call.name, "args": args, "result": result})
+            if call.name == "report_test_problem" and result.startswith("REPORTED"):
+                test = result.removeprefix("REPORTED: ")
+                return stopped(step, tools["run_tests"](), f"Reported {test} as contradicting the requirements",
+                               disputed={"test": test, "reason": str(args.get("reason", ""))})
+            if watch and call.name == "run_tests" and watch.record(result):
+                return stuck(step, result)
             results.append(types.Part(function_response=types.FunctionResponse(
                 id=call.id, name=call.name, response={"result": result})))
         history.append(types.Content(role="user", parts=results))
@@ -418,14 +559,88 @@ def run_agent(workspace, on_step=None, model=MODEL, max_steps=15, system_prompt=
             "model": current["model"]}
 
 
+# ---- The feedback loop (C4): when the builder can't pass, is the test wrong or the code? ----
+
+def snapshot_tests(executor):
+    """The tester's files, {path: text}: everything in tests/ a review may change (conftest.py is protected)."""
+    return {path: executor.read_file(path) for path in executor.list_files("tests")
+            if "__pycache__" not in path and not path.endswith(DATABASE_FILES) and path not in PROTECTED}
+
+
+def review_rounds(workspace, executor, outcome, model=MODEL, step_logger=None, on_note=None, rounds=REVIEW_ROUNDS):
+    """Team mode, after the builder's run. While it hasn't passed (it got stuck, reported a test, or ran out of
+    steps) and rounds remain:
+      1. the tester re-checks the failing tests against its own requirements: it fixes a wrong test, or leaves a
+         right one alone and says what the code gets wrong. A review that leaves the tests broken is undone.
+      2. the orchestrator runs the tests itself: if fixing the tests was all it took, the work is done.
+      3. otherwise the builder gets another round, with a fresh history and the tester's verdict.
+
+    step_logger(label, role) returns the on_step callback for one agent run; on_note(text, output) reports the
+    orchestrator's own decisions. Returns the final outcome, with "steps" counting every builder round and
+    "reviews": [{"round", "tests", "changed", "verdict", "model"}].
+    """
+    note = on_note or (lambda text, output="": None)
+    logger = step_logger or (lambda label, role: None)
+    reviews, steps = [], outcome["steps"]
+
+    for round_number in range(1, rounds + 1):
+        if outcome["passed"]:
+            break
+        dispute = outcome.get("disputed")
+        failing = [dispute["test"]] if dispute else (outcome.get("stuck") or sorted(failing_tests(outcome["test_output"])))
+        if not failing:
+            note("No test to review: the code itself doesn't load", outcome["test_output"])
+            break
+        why = (f"the developer reported {dispute['test']}" if dispute else
+               "the developer stopped making progress" if outcome.get("stuck") else "the developer ran out of steps")
+        note(f"Review {round_number}: {why}, so the tester re-checks {', '.join(failing)}", outcome["test_output"])
+
+        before = snapshot_tests(executor)
+        min_tests = collected_count(make_tools(executor, "tester")["collect_tests"]()) or 3  # a review may not delete tests
+        review = run_agent(workspace, on_step=logger(f"Tester (review {round_number}) · ", "tester"), model=model,
+                           max_steps=REVIEW_STEPS, system_prompt=REVIEWER_PROMPT, role="tester", executor=executor,
+                           start_message=review_message(failing, outcome["test_output"], dispute),
+                           done_check=lambda tools: review_done(tools, min_tests))
+        if review["passed"]:
+            changed, verdict = snapshot_tests(executor) != before, review["summary"].strip()
+            if verdict.startswith("Stopped:"):  # out of steps before it said anything: don't pass that on as a verdict
+                verdict = ("The tester ran out of steps before explaining; see what changed in tests/test_app.py."
+                           if changed else "The tester found nothing to change in the tests.")
+        else:  # it left the tests broken or short: put them back exactly as they were
+            undo = logger(f"Tester (review {round_number}, undone) · ", "tester")
+            for path in snapshot_tests(executor):
+                content = before.get(path, "")  # a file it added is emptied (executors can't delete)
+                executor.write_file(path, content)
+                if undo:  # logged like a write, so the dashboard's files show what's really there
+                    undo({"step": 0, "tool": "write_file", "args": {"path": path, "content": content},
+                          "result": f"Restored {path}"})
+            changed, verdict = False, "The review didn't finish, so the tests were left as they were."
+        reviews.append({"round": round_number, "tests": failing, "changed": changed, "verdict": verdict,
+                        "model": review.get("model", model)})
+
+        output = make_tools(executor, "builder")["run_tests"]()  # our own check, not the tester's word
+        if tests_pass(output):
+            note(f"Review {round_number}: the tester corrected the tests, and every test passes now", output)
+            outcome = {**outcome, "passed": True, "test_output": output,
+                       "summary": f"Passed after the tester corrected {', '.join(failing)}"}
+            break
+
+        outcome = run_agent(workspace, on_step=logger(f"Builder (round {round_number + 1}) · ", "builder"),
+                            model=model, max_steps=RETRY_STEPS, system_prompt=BUILDER_DB_PROMPT, executor=executor,
+                            start_message=retry_message(failing, verdict, changed), reviewable=True)
+        steps += outcome["steps"]
+
+    return {**outcome, "steps": steps, "reviews": reviews}
+
+
 # ---- Terminal version: python orchestrator/agent.py ----
 
-def print_step(event):
+def print_step(event, label=""):
     """Short log line: hide file contents, show just the last line of each result."""
     shown = {k: (f"<{len(v)} chars>" if k == "content" else v) for k, v in event["args"].items()}
     result = event["result"].strip()
     last_line = result.splitlines()[-1][:80] if result else ""
-    print(f"Step {event['step']}: {event['tool']}({shown}) -> {last_line}")
+    print(f"{label}Step {event['step']}: {event['tool']}({shown}) -> {last_line}")
 
 if __name__ == "__main__":
     from dotenv import load_dotenv
@@ -460,7 +675,11 @@ if __name__ == "__main__":
             print("\n=== Builder ===")
 
         outcome = run_agent(workspace, on_step=print_step, max_steps=25 if description else 15, executor=executor,
-                            system_prompt=BUILDER_DB_PROMPT if description else None)
+                            system_prompt=BUILDER_DB_PROMPT if description else None, reviewable=bool(description))
+        if description:  # the feedback loop: a stuck builder gets its failing tests re-checked by the tester
+            outcome = review_rounds(workspace, executor, outcome,
+                                    step_logger=lambda label, role: (lambda event: print_step(event, label)),
+                                    on_note=lambda text, output="": print(f"\n=== Orchestrator: {text} ==="))
 
         # Keep a local copy of the result: a Vercel sandbox (and its files) disappears when the block ends.
         for path in executor.list_files():

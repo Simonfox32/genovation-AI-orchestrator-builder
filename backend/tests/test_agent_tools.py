@@ -304,6 +304,124 @@ def test_database_template_explains_how_to_run_itself(tmp_path):
     assert agent.make_tools(executor, "builder")["write_file"]("requirements.txt", "requests").startswith("REFUSED")
 
 
+# ---- The feedback loop (C4): stuck builders, reported tests, reviews ----
+
+def pytest_output(*failing):
+    """What pytest -q prints when these tests fail."""
+    return "".join(f"FAILED tests/test_app.py::{name} - assert 0\n" for name in failing) + f"{len(failing)} failed"
+
+
+def fake_gemini(monkeypatch, calls_for_turn):
+    """Fake Gemini whose n-th reply asks for the tool calls calls_for_turn(n) returns ([(name, args)]), or says it's
+    done when that's empty. Returns the configs it was called with (they show which tools were offered)."""
+    from types import SimpleNamespace
+    from google.genai import types
+
+    configs = []
+
+    class FakeModels:
+        def generate_content(self, model, contents, config):
+            configs.append(config)
+            calls = calls_for_turn(len(configs))
+            if not calls:
+                content = types.Content(role="model", parts=[types.Part(text="Done.")])
+                return SimpleNamespace(candidates=[SimpleNamespace(content=content)], function_calls=None, text="Done.")
+            parts = [types.Part(function_call=types.FunctionCall(id=f"c{i}", name=name, args=args))
+                     for i, (name, args) in enumerate(calls)]
+            asked = [SimpleNamespace(id=f"c{i}", name=name, args=args) for i, (name, args) in enumerate(calls)]
+            return SimpleNamespace(candidates=[SimpleNamespace(content=types.Content(role="model", parts=parts))],
+                                   function_calls=asked, text=None)
+
+    monkeypatch.setattr(agent.genai, "Client", lambda **settings: SimpleNamespace(models=FakeModels()))
+    return configs
+
+
+def offered_tools(config):
+    return [declaration.name for declaration in config.tools[0].function_declarations]
+
+
+def test_failing_tests_are_read_from_pytest_output(workspace):
+    output = agent.make_tools(LocalExecutor(workspace), "builder")["run_tests"]()  # the starter app fails its tests
+
+    assert agent.failing_tests(output) and all(name.startswith("test_") for name in agent.failing_tests(output))
+    assert agent.failing_tests("ERROR tests/test_app.py - SyntaxError\n1 error in 0.1s") == set()  # names no test
+
+
+def test_progress_watch_catches_a_builder_going_round_in_circles():
+    # The 11-18 star wars run: 13 failing, a typo, then the same single test failing run after run.
+    watch = agent.ProgressWatch(limit=3)
+
+    assert not watch.record(pytest_output(*[f"test_r{n}_x" for n in range(1, 14)]))
+    assert not watch.record("ERROR tests/test_app.py - SyntaxError\n1 error")  # a typo isn't being stuck
+    assert not watch.record(pytest_output("test_r10_dispatch"))  # 13 -> 1: progress
+    assert not watch.record(pytest_output("test_r10_dispatch"))
+    assert not watch.record(pytest_output("test_r10_dispatch"))
+    assert watch.record(pytest_output("test_r10_dispatch"))  # 3 runs with no fewer failures: stuck
+    assert watch.suspects == {"test_r10_dispatch"}
+
+
+def test_progress_watch_leaves_an_improving_builder_alone():
+    watch = agent.ProgressWatch(limit=3)
+
+    for remaining in range(10, 0, -1):
+        assert not watch.record(pytest_output(*[f"test_r{n}_x" for n in range(remaining)]))
+
+
+def test_a_builder_can_only_report_a_test_that_is_failing(workspace):
+    tools = agent.make_tools(LocalExecutor(workspace), "builder")
+    failing = sorted(agent.failing_tests(tools["run_tests"]()))[0]
+
+    assert tools["report_test_problem"](failing, "contradicts requirement 8") == f"REPORTED: {failing}"
+    assert tools["report_test_problem"]("test_that_does_not_exist", "x").startswith("REFUSED")
+    assert "report_test_problem" not in agent.make_tools(LocalExecutor(workspace), "tester")
+
+
+def test_a_stuck_builder_is_stopped_early_in_team_mode(workspace, monkeypatch):
+    configs = fake_gemini(monkeypatch, lambda turn: [("run_tests", {})])  # never changes anything
+
+    outcome = agent.run_agent(workspace, max_steps=10, reviewable=True)
+
+    assert outcome["passed"] is False
+    assert outcome["steps"] == 4  # its best at run 1, then 3 runs without fewer failures
+    assert outcome["stuck"] and outcome["summary"].startswith("Stopped: no progress in 3 test runs")
+    assert "report_test_problem" in offered_tools(configs[0])
+
+
+def test_without_a_tester_the_builder_keeps_its_whole_budget(workspace, monkeypatch):
+    # ORCHESTRATOR=agent: the tests are our hand-written ones, so there's no one to review them and no reason to stop.
+    configs = fake_gemini(monkeypatch, lambda turn: [("run_tests", {})])
+
+    outcome = agent.run_agent(workspace, max_steps=6)
+
+    assert outcome["steps"] == 6 and "stuck" not in outcome
+    assert "report_test_problem" not in offered_tools(configs[0])
+
+
+def test_a_reported_test_ends_the_builders_turn(workspace, monkeypatch):
+    failing = sorted(agent.failing_tests(agent.make_tools(LocalExecutor(workspace))["run_tests"]()))[0]
+    fake_gemini(monkeypatch, lambda turn: [("report_test_problem", {"test": failing, "reason": "contradicts R8"})])
+
+    outcome = agent.run_agent(workspace, max_steps=10, reviewable=True)
+
+    assert outcome["steps"] == 1
+    assert outcome["disputed"] == {"test": failing, "reason": "contradicts R8"}
+
+
+def test_a_review_may_fix_tests_but_never_delete_them(tmp_path):
+    executor = LocalExecutor(tmp_path)
+    agent.seed_workspace(executor, include_tests=False, template=agent.TEMPLATE_DB)
+    executor.write_file("tests/REQUIREMENTS.md", "1. a\n2. b\n3. c\n")
+    three = "".join(f"def test_r{n}_x(client):\n    assert True\n\n\n" for n in (1, 2, 3))
+    executor.write_file("tests/test_app.py", three)
+    tools = agent.make_tools(executor, "tester")
+
+    assert agent.review_done(tools, min_tests=3)[0]  # unlike the first tester run, passing tests are fine now
+
+    executor.write_file("tests/test_app.py", three.replace("def test_r3_x(client):\n    assert True\n", ""))
+    done, _, feedback = agent.review_done(tools, min_tests=3)
+    assert not done and "at least 3 tests" in feedback
+
+
 def test_prompts_cover_missing_parents():
     # Nov 18 bug: creating a character in a faction that doesn't exist came back as 409 "already exists". The builder
     # turned EVERY IntegrityError into 409 (a missing parent raises one too), and no test tried a missing parent,

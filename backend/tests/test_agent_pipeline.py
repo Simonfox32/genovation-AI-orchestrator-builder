@@ -421,3 +421,165 @@ def test_download_never_lets_a_path_escape_the_folder(monkeypatch, db_session):
     names = zip_names(client.get(f"/projects/{project_id}/download"))
 
     assert names == [f"ai-build-router-{project_id[:8]}/app/main.py"]
+
+
+# ---- The feedback loop (C4): a stuck builder gets its failing tests re-checked by the tester ----
+# Fake agents act out each scenario; the orchestrator's own test runs between them are real pytest runs.
+
+LOOP_REQUIREMENTS = "1. Things can be listed\n2. After a refused purchase and a 400 reward, the total is 600\n"
+LOOP_GOOD_TEST = "def test_r1_list(client):\n    assert client.get('/things').status_code == 200\n\n\n"
+
+
+def loop_tests(expected_total):
+    return LOOP_GOOD_TEST + f"def test_r2_total(client):\n    assert client.get('/total').json() == {expected_total}\n"
+
+
+def loop_app(total):
+    return ("from fastapi import FastAPI\n\napp = FastAPI()\n\n\n@app.get('/things')\ndef things():\n    return []\n\n\n"
+            f"@app.get('/total')\ndef total():\n    return {total}\n")
+
+
+def scripted_team(calls, *acts):
+    """Fake agents that perform `acts` in order, one per run_agent call: act(executor, on_step) -> outcome."""
+    queue = list(acts)
+
+    def run_agent(workspace, on_step=None, role="builder", start_message=None, executor=None, **kwargs):
+        calls.append({"role": role, "start_message": start_message, "system_prompt": kwargs.get("system_prompt"),
+                      "reviewable": kwargs.get("reviewable")})
+        return queue.pop(0)(executor, on_step)
+    return run_agent
+
+
+def write(executor, on_step, path, content):
+    executor.write_file(path, content)
+    on_step({"step": 1, "tool": "write_file", "args": {"path": path, "content": content}, "result": f"Wrote {path}"})
+
+
+def writes_tests_expecting(total):
+    def act(executor, on_step):
+        executor.write_file("tests/REQUIREMENTS.md", LOOP_REQUIREMENTS)
+        write(executor, on_step, "tests/test_app.py", loop_tests(total))
+        return {"passed": True, "steps": 2, "summary": "done", "test_output": "2 failed in 0.1s"}
+    return act
+
+
+def builder_returning(total):
+    """Writes the app, then reports what a real test run says; stuck on whatever still fails."""
+    def act(executor, on_step):
+        write(executor, on_step, "app/main.py", loop_app(total))
+        output = orchestration.agent.make_tools(executor)["run_tests"]()
+        if orchestration.agent.tests_pass(output):  # NOT "no failing names": tests that don't load name none either
+            return {"passed": True, "steps": 5, "summary": "done", "test_output": output}
+        return {"passed": False, "steps": 5, "summary": "Stopped: no progress", "test_output": output,
+                "stuck": sorted(orchestration.agent.failing_tests(output))}
+    return act
+
+
+def reviewer(verdict, fix_to=None):
+    def act(executor, on_step):
+        if fix_to is not None:
+            write(executor, on_step, "tests/test_app.py", loop_tests(fix_to))
+        return {"passed": True, "steps": 2, "summary": verdict, "test_output": ""}
+    return act
+
+
+def task_names(project):
+    return [task["name"] for task in project["tasks"]]
+
+
+def test_feedback_loop_a_wrong_test_is_corrected_and_nothing_else_is_needed(monkeypatch):
+    # The 11-18 star wars run in miniature: the app is right (600); the tester's test expects 300.
+    monkeypatch.setenv("ORCHESTRATOR", "agent-team")
+    calls = []
+    monkeypatch.setattr(orchestration.agent, "run_agent", scripted_team(
+        calls, writes_tests_expecting(300), builder_returning(600),
+        reviewer("fixed: test_r2_total expected 300, but requirement 2 says 600", fix_to=600)))
+
+    project = submit("A store")
+
+    assert [c["role"] for c in calls] == ["tester", "builder", "tester"]  # the fix was enough: no builder round 2
+    assert calls[1]["reviewable"] is True
+    assert calls[2]["system_prompt"] == orchestration.agent.REVIEWER_PROMPT
+    assert "test_r2_total" in calls[2]["start_message"]
+    assert project["status"] == "completed"
+    assert "the tester re-checked the failing tests and corrected test_r2_total" in project["summary"]
+    names = task_names(project)
+    assert ("Orchestrator · Review 1: the developer stopped making progress, so the tester re-checks test_r2_total"
+            in names)
+    assert "Tester (review 1) · Wrote tests/test_app.py" in names
+    assert "Orchestrator · Review 1: the tester corrected the tests, and every test passes now" in names
+    assert names[-1].startswith("Verified by the orchestrator: 2 passed")
+
+
+def test_feedback_loop_a_right_test_sends_the_builder_back_with_the_verdict(monkeypatch):
+    monkeypatch.setenv("ORCHESTRATOR", "agent-team")
+    calls = []
+    monkeypatch.setattr(orchestration.agent, "run_agent", scripted_team(
+        calls, writes_tests_expecting(600), builder_returning(300),
+        reviewer("correct: the code returns 300, but requirement 2 says 600"), builder_returning(600)))
+
+    project = submit("A store")
+
+    assert [c["role"] for c in calls] == ["tester", "builder", "tester", "builder"]
+    retry = calls[3]["start_message"]
+    assert "The tester says the tests are right" in retry
+    assert "correct: the code returns 300, but requirement 2 says 600" in retry
+    assert calls[3]["reviewable"] is True
+    assert project["status"] == "completed"
+    assert "upheld test_r2_total" in project["summary"]
+    assert "built your backend in 10 steps" in project["summary"]  # both builder rounds count
+    assert "Builder (round 2) · Wrote app/main.py" in task_names(project)
+
+
+def test_feedback_loop_gives_up_after_its_rounds(monkeypatch):
+    monkeypatch.setenv("ORCHESTRATOR", "agent-team")
+    calls = []
+    monkeypatch.setattr(orchestration.agent, "run_agent", scripted_team(
+        calls, writes_tests_expecting(600), builder_returning(300),
+        reviewer("correct"), builder_returning(300), reviewer("still correct"), builder_returning(300)))
+
+    project = submit("A store")
+
+    assert [c["role"] for c in calls] == ["tester", "builder"] + ["tester", "builder"] * orchestration.agent.REVIEW_ROUNDS
+    assert project["status"] == "failed"
+    assert "upheld test_r2_total; then upheld test_r2_total" in project["summary"]
+
+
+def test_a_review_that_breaks_the_tests_is_undone(monkeypatch):
+    monkeypatch.setenv("ORCHESTRATOR", "agent-team")
+    calls = []
+
+    def breaks_the_tests(executor, on_step):
+        write(executor, on_step, "tests/test_app.py", "def test_r1_list(:\n")  # doesn't even load
+        return {"passed": False, "steps": 8, "summary": "Stopped: hit the step limit", "test_output": ""}
+
+    monkeypatch.setattr(orchestration.agent, "run_agent", scripted_team(
+        calls, writes_tests_expecting(600), builder_returning(300), breaks_the_tests, builder_returning(600)))
+
+    project = submit("A store")
+
+    assert "the tests were left as they were" in calls[3]["start_message"]
+    assert project["status"] == "completed"  # round 2 ran against the ORIGINAL tests, and passed them
+    import io
+    import zipfile
+    download = zipfile.ZipFile(io.BytesIO(client.get(f"/projects/{project['id']}/download").content))
+    real = download.read(f"ai-build-router-{project['id'][:8]}/tests/test_app.py").decode()
+    assert real == loop_tests(600)  # the real file was put back...
+    shown = {f["path"]: f["content"] for f in project["files"]}
+    assert shown["tests/test_app.py"] == loop_tests(600)  # ...and the dashboard shows it, not the broken version
+    assert "Tester (review 1, undone) · Wrote tests/test_app.py" in task_names(project)
+
+
+def test_a_review_that_runs_out_of_steps_still_gives_the_builder_something_useful(monkeypatch):
+    # Seen in a real review (replaying 11-18's run): it used every step fixing the test and never wrote a verdict.
+    monkeypatch.setenv("ORCHESTRATOR", "agent-team")
+    calls = []
+    monkeypatch.setattr(orchestration.agent, "run_agent", scripted_team(
+        calls, writes_tests_expecting(600), builder_returning(300),
+        reviewer("Stopped: hit the step limit"), builder_returning(600)))
+
+    submit("A store")
+
+    retry = calls[3]["start_message"]
+    assert "Stopped: hit the step limit" not in retry
+    assert "The tester found nothing to change in the tests." in retry
