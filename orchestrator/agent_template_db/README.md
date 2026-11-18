@@ -17,21 +17,37 @@ requirements and tests, a builder agent wrote the code until every test passed.
 
 ## Run it
 
-Needs Python 3.12 or newer.
+Needs Python 3.12 or newer (check with `python3 --version`).
+
+Open a terminal in this folder (the one with this README) and run the commands below **one at a time**.
+Each box holds exactly one command. If you're reading this file as plain text, copy only the command line,
+not the `` ```bash `` and `` ``` `` lines around it: the shell reads backticks as "run this", and gets confused.
+
+**1. Create a private Python environment for this project** (once):
 
 ```bash
 python3 -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
+```
+
+**2. Switch it on** (again in every new terminal). Your prompt then starts with `(.venv)`:
+
+```bash
+source .venv/bin/activate
+```
+
+**3. Install the packages** (once):
+
+```bash
 pip install -r requirements.txt
 ```
 
-Check it works:
+**4. Check it works.** Every test should pass:
 
 ```bash
 python -m pytest -q
 ```
 
-Start the server:
+**5. Start the server** (Ctrl+C stops it):
 
 ```bash
 uvicorn app.main:app --reload
@@ -39,6 +55,8 @@ uvicorn app.main:app --reload
 
 Then open **http://localhost:8000/docs**: an interactive page listing every endpoint. Pick one, click
 **Try it out**, fill in the request, and **Execute**.
+
+**On Windows**, use `python` instead of `python3` in step 1, and `.venv\Scripts\activate` in step 2.
 
 Data is saved in `app.db` in this folder. Delete that file to start again with an empty database.
 

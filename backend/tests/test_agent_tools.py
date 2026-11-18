@@ -1,4 +1,5 @@
 """Tests for the agents' tools and done-checks (orchestrator/agent.py). Real files and real pytest; no Gemini."""
+import re
 import shutil
 
 import pytest
@@ -301,3 +302,15 @@ def test_database_template_explains_how_to_run_itself(tmp_path):
     assert "uvicorn app.main:app" in executor.read_file("README.md")
     assert "sqlalchemy==2.1.6" in executor.read_file("requirements.txt")
     assert agent.make_tools(executor, "builder")["write_file"]("requirements.txt", "requests").startswith("REFUSED")
+
+
+def test_database_template_readme_commands_are_safe_to_paste():
+    # People copy these boxes straight into a terminal. One command per box, so copying a box never brings along
+    # a half-run sequence; and no "# comment", because zsh (the macOS default) passes a typed # on as an argument.
+    readme = (agent.TEMPLATE_DB / "README.md").read_text()
+    commands = re.findall(r"```bash\n(.*?)```", readme, re.S)
+
+    assert len(commands) >= 5
+    for command in commands:
+        assert len(command.strip().splitlines()) == 1, command
+        assert "#" not in command, command
