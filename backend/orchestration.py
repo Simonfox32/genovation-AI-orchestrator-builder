@@ -221,9 +221,25 @@ def run_agent_pipeline(project_id: UUID, session_factory, with_tester: bool = Fa
 
         outcome = agent.run_agent(workspace, on_step=make_saver("Builder · " if with_tester else ""),
                                   max_steps=25 if with_tester else 15, model=model, executor=executor,
-                                  system_prompt=agent.BUILDER_DB_PROMPT if with_tester else None)
+                                  system_prompt=agent.BUILDER_DB_PROMPT if with_tester else None,
+                                  reviewable=with_tester)
+
+        if with_tester:
+            # The feedback loop: if the builder is stuck, the tester re-checks the failing tests (C4).
+            def save_note(text, output=""):
+                project.tasks.append(Task(
+                    id=uuid4(), position=len(project.tasks) + 1, name=f"Orchestrator · {text}"[:200],
+                    description="A decision by the orchestrator", tool="orchestrator", status="completed",
+                    attempts=1, output=output[-2000:] or None,
+                ))
+                _touch(project)
+                db.commit()
+
+            outcome = agent.review_rounds(workspace, executor, outcome, model=model, on_note=save_note,
+                                          step_logger=lambda label, role: make_saver(label, tester=role == "tester"))
         agents = "AI agents" if with_tester else "An AI agent"
-        models = _model_note(model, *([tester] if tester else []), outcome)
+        models = _model_note(model, *([tester] if tester else []), outcome, *outcome.get("reviews", []))
+        reviews = _review_note(outcome.get("reviews", []))
 
         # The orchestrator's own verdict, from its own test run (not the agent's claim).
         verdict = _last_line(outcome["test_output"])
@@ -236,11 +252,11 @@ def run_agent_pipeline(project_id: UUID, session_factory, with_tester: bool = Fa
         if outcome["passed"]:
             project.status = "completed"
             project.summary = (f"{agents} ({models}) built {what} in {outcome['steps']} steps. "
-                               f"Verified by our own test run: {verdict}. {requirements}")
+                               f"Verified by our own test run: {verdict}. {requirements}{reviews}")
         else:
             project.status = "failed"
             project.summary = (f"The developer agent ({models}) did not get all tests passing: "
-                               f"{outcome['summary']}. Last test run: {verdict}. {requirements}")
+                               f"{outcome['summary']}. Last test run: {verdict}. {requirements}{reviews}")
         # Save every file now: the sandbox (and everything in it) is destroyed when the run ends.
         project.artifact = _collect_files(executor)
         _touch(project)
@@ -303,6 +319,14 @@ def _model_note(chosen: str, *outcomes) -> str:
     if not used:
         return chosen
     return f"{chosen}, with {', '.join(used)} taking over when it was overloaded"
+
+
+def _review_note(reviews: list) -> str:
+    """One sentence on the feedback loop for the summary, e.g. ' Feedback loop: the tester corrected test_r10_x.'"""
+    if not reviews:
+        return ""
+    verdicts = [f"{'corrected' if r['changed'] else 'upheld'} {', '.join(r['tests'])}" for r in reviews]
+    return f" Feedback loop: the tester re-checked the failing tests and {'; then '.join(verdicts)}."
 
 
 def _describe_step(event) -> tuple[str, str]:

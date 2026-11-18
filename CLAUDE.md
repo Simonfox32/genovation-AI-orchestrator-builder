@@ -74,6 +74,16 @@ backend/.venv/bin/python orchestrator/sandbox/build_vercel_snapshot.py       # p
   `PROTECTED` (SQLite gotchas: foreign keys must be switched on per connection; in-memory tests need `StaticPool`).
   The template's `requirements.txt` is `PROTECTED` too. It pins the exact versions in the sandbox image and snapshot (keep the three in sync).
   The template's `README.md` explains how to run a downloaded project.
+- **Feedback loop (C4, team mode):** the builder runs with `reviewable=True`. It may call `report_test_problem`
+  (accepted only for a test that is failing). It is also stopped early after `STUCK_AFTER` (3) test runs without fewer failures
+  than its best (`ProgressWatch`). Then `agent.review_rounds` takes over:
+  1. The tester re-checks the failing tests against its requirements (`REVIEWER_PROMPT`). `review_done` requires
+     that the tests still load, none were removed, and every requirement is still covered. A review that fails this is undone.
+  2. The orchestrator re-runs the tests itself.
+  3. If they still fail, the builder gets a fresh round (`RETRY_STEPS`, new history) with the tester's verdict.
+
+  There are at most `REVIEW_ROUNDS` (2) rounds. Dashboard rows: `Orchestrator · …`, `Tester (review n) · …`, `Builder (round n) · …`.
+  `ORCHESTRATOR=agent` (our hand-written todo tests) has no reviewer, so its builder keeps its full step budget.
 - **Download:** when an agent run ends, the whole workspace is saved in `projects.artifact` (JSON `{path: text}`, skipping
   `.db` files and `__pycache__`) before the sandbox is destroyed. `GET /projects/{id}/download` serves it as a zip
   (paths that would escape the folder are skipped: "zip slip"). `downloadable` in the API shows the dashboard's download button.
