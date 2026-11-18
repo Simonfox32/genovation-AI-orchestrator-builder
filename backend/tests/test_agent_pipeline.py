@@ -144,6 +144,7 @@ def fake_team(calls, tester_passes=True):
     directly), and the tester really writes a test file so the pipeline can count its tests."""
     def run_agent(workspace, on_step=None, role="builder", start_message=None, executor=None, **kwargs):
         calls.append({"role": role, "start_message": start_message, "model": kwargs.get("model"),
+                      "system_prompt": kwargs.get("system_prompt"),
                       "executor": executor,
                       "test_files": sorted(Path(p).name for p in executor.list_files("tests")
                                            if Path(p).name.startswith("test_"))})
@@ -332,6 +333,7 @@ def test_team_shares_one_sandbox_seeded_with_the_starter_app(monkeypatch, fake_s
     sandbox, = fake_sandbox.instances  # exactly one sandbox for the whole project
     assert calls[0]["executor"] is sandbox and calls[1]["executor"] is sandbox
     assert "app/main.py" in sandbox.files                   # the starter app went INTO the sandbox
+    assert "app/db.py" in sandbox.files and "tests/conftest.py" in sandbox.files  # team mode: the database starter
     assert "tests/test_todos.py" not in sandbox.files       # team mode: the built-in tests stayed out
     assert "2 listed by the tester agent from your description, covered by 2 tests" in project["summary"]
     assert sandbox.closed                                   # destroyed afterwards
@@ -358,3 +360,15 @@ def test_a_failing_close_does_not_break_the_pipeline(monkeypatch, fake_sandbox):
     assert submit()["status"] == "completed"
     assert orchestration.AGENT_SLOT.acquire(blocking=False)
     orchestration.AGENT_SLOT.release()
+
+
+def test_team_builder_gets_the_database_instructions(monkeypatch):
+    monkeypatch.setenv("ORCHESTRATOR", "agent-team")
+    calls = []
+    monkeypatch.setattr(orchestration.agent, "run_agent", fake_team(calls))
+
+    submit("A store with orders")
+
+    tester, builder = calls
+    assert builder["system_prompt"] == orchestration.agent.BUILDER_DB_PROMPT
+    assert tester["system_prompt"] is None  # the tester uses its own default prompt

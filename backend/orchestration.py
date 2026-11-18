@@ -168,7 +168,9 @@ def run_agent_pipeline(project_id: UUID, session_factory, with_tester: bool = Fa
         model = agent.model_for(project.optimization)  # Fastest / Balanced / Best Quality -> cheap / medium / strong
         tester = None
         executor = make_executor(workspace)
-        agent.seed_workspace(executor, include_tests=not with_tester)  # the tester writes its own tests
+        # Team mode: the database starter, and the tester writes its own tests. Otherwise: the todo app + its tests.
+        agent.seed_workspace(executor, include_tests=not with_tester,
+                             template=agent.TEMPLATE_DB if with_tester else agent.TEMPLATE)
         if with_tester:
             what = "your backend"
             project.summary = (f"Two AI agents ({model}) are working: a tester is writing tests from your "
@@ -217,7 +219,8 @@ def run_agent_pipeline(project_id: UUID, session_factory, with_tester: bool = Fa
             db.commit()
 
         outcome = agent.run_agent(workspace, on_step=make_saver("Builder · " if with_tester else ""),
-                                  max_steps=20 if with_tester else 15, model=model, executor=executor)
+                                  max_steps=25 if with_tester else 15, model=model, executor=executor,
+                                  system_prompt=agent.BUILDER_DB_PROMPT if with_tester else None)
         agents = "AI agents" if with_tester else "An AI agent"
         models = _model_note(model, *([tester] if tester else []), outcome)
 
