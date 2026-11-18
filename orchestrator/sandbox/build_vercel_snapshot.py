@@ -11,7 +11,8 @@ from pathlib import Path
 from dotenv import load_dotenv
 from vercel.sandbox import sync as sandbox
 
-PACKAGES = ["fastapi==0.143.3", "pytest==9.1.1", "httpx2==2.13.1"]  # same pins as requirements.txt and the Dockerfile
+# Same pins as requirements.txt and the Dockerfile. sqlalchemy: the database starter template (SQLite is built in).
+PACKAGES = ["fastapi==0.143.3", "pytest==9.1.1", "httpx2==2.13.1", "sqlalchemy==2.1.6"]
 
 load_dotenv(Path(__file__).resolve().parents[2] / "backend" / ".env")
 
@@ -25,7 +26,9 @@ try:
     if result.returncode != 0:
         raise SystemExit(result.stderr.decode()[-2000:])
 
-    check = box.run_command("python", ["-c", "import fastapi, pytest; print('fastapi', fastapi.__version__, '| pytest', pytest.__version__)"],
+    check = box.run_command("python", ["-c", "import fastapi, pytest, sqlalchemy, sqlite3; print('fastapi', fastapi.__version__, "
+                                       "'| pytest', pytest.__version__, '| sqlalchemy', sqlalchemy.__version__, "
+                                       "'| sqlite', sqlite3.sqlite_version)"],
                             capture_output=True)
     print(check.stdout.decode().strip())
 

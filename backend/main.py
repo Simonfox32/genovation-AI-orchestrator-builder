@@ -1,4 +1,7 @@
+import io
 import os
+import posixpath
+import zipfile
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Annotated
@@ -7,7 +10,7 @@ from uuid import UUID, uuid4
 from models import Project
 
 from sqlalchemy.orm import Session
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Depends
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Depends, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import AfterValidator, BaseModel, StringConstraints
 from database import get_db, get_session_factory
@@ -96,6 +99,7 @@ class ProjectResponse(BaseModel):
     updated_at: UTCDatetime
     tasks: list[TaskResponse]
     files: list[GeneratedFileResponse] = []  # empty unless the coding agent (ORCHESTRATOR=agent) wrote files
+    downloadable: bool = False  # true once GET /projects/{id}/download can return the whole project as a zip
 
 
 NOT_FOUND = {404: {"description": "Project not found"}}
@@ -145,6 +149,27 @@ def get_project(project_id: UUID, db : Session = Depends(get_db)):
     if project is None:
         raise HTTPException(status_code=404, detail="Project not found")
     return project
+
+
+@app.get("/projects/{project_id}/download", responses={404: {"description": "Project not found, or no files"}})
+def download_project(project_id: UUID, db : Session = Depends(get_db)):
+    """The generated project as a zip: every file the agents' run left in its workspace (runnable: see its README)."""
+    project = db.get(Project, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if not project.artifact:
+        raise HTTPException(status_code=404, detail="This project has no files to download")
+
+    folder = f"ai-build-router-{str(project.id)[:8]}"
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        for path, content in sorted(project.artifact.items()):
+            clean = posixpath.normpath(path)
+            if clean.startswith(("/", "..")) or clean == ".":
+                continue  # "zip slip": an AI-written path must never land outside the folder when unzipped
+            zip_file.writestr(f"{folder}/{clean}", content)
+    return Response(content=buffer.getvalue(), media_type="application/zip",
+                    headers={"Content-Disposition": f'attachment; filename="{folder}.zip"'})
 
 
 @app.patch("/projects/{project_id}/status", response_model=ProjectResponse, responses=NOT_FOUND, dependencies=[Depends(require_status_api_key)])

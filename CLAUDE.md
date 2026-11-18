@@ -18,7 +18,7 @@ design and decisions log: `docs/agent-orchestrator-plan.md` (both local, may be 
 | `backend/` | Simon | FastAPI API, SQLAlchemy models, Alembic migrations, pytest suite |
 | `backend/orchestration.py` | Simon | The only backend file that imports orchestrator code: decompose → route → save tasks |
 | `orchestrator/` | Anula (v1) | `decomposer.py` (plan), `router.py` (model tiers + `check()`), `llm.py` (Gemini `call_llm`) |
-| `orchestrator/agent.py`, `executors.py`, `agent_template/`, `sandbox/` | Simon + Claude | v2: the coding agents; executors decide WHERE code runs (local / Docker / Vercel Sandbox); the sandbox image recipes |
+| `orchestrator/agent.py`, `executors.py`, `agent_template/`, `agent_template_db/`, `sandbox/` | Simon + Claude | v2: the coding agents; executors decide WHERE code runs (local / Docker / Vercel Sandbox); starter templates (in-memory todo app; FastAPI + SQLite/SQLAlchemy); the sandbox image recipes |
 | `frontend/` | Fill | React + TypeScript (Vite) form and dashboard; deployed on Vercel |
 | `spike/` | Simon | Learning scripts (`my_agent.py`, sandbox lessons); `spike/runs/` is git-ignored agent output |
 | `requirements.txt` (root) | | The real pinned Python deps (Railway installs from the root); `backend/requirements.txt` just points to it |
@@ -61,7 +61,13 @@ backend/.venv/bin/python orchestrator/sandbox/build_vercel_snapshot.py       # p
   `orchestrator/agent_template/`); each agent step becomes a task row, and `files` on the project shows the final code.
 - `ORCHESTRATOR=agent-team`: a tester agent (role `tester`) writes `tests/test_app.py` from the user's description,
   then the builder makes it pass. The tester first writes `tests/REQUIREMENTS.md` (numbered); every requirement
-  needs a `test_r<n>_...` test.
+  needs a `test_r<n>_...` test. The tester's checklist makes the basics explicit for every kind of thing stored
+  (create / fetch / list incl. children / update / delete), blank text -> 422, duplicates -> 409, plus edge cases such
+  as getting around a rule through another endpoint. Projects start from `agent_template_db/` (SQLite + SQLAlchemy): the builder uses
+  `BUILDER_DB_PROMPT` (models / schemas / main, foreign keys with ON DELETE CASCADE, sessions only via `get_db`);
+  tests use the `client` fixture, a fresh in-memory database per test. `app/db.py` and `tests/conftest.py` are
+  `PROTECTED` (SQLite gotchas: foreign keys must be switched on per connection; in-memory tests need `StaticPool`).
+  The sandbox image/snapshot must include `sqlalchemy`; rebuild and update `VERCEL_SANDBOX_SNAPSHOT_ID` after changing it.
 - `EXECUTOR=vercel`: the agents' code runs in a Vercel Sandbox microVM (no secrets, no network), via
   `SandboxExecutor`. **Required whenever an agent mode is on in a public deployment** (this is Story #124's fix).
   Unset: `LocalExecutor`, which runs AI-written code on the server itself (local development only).

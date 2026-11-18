@@ -252,3 +252,52 @@ def test_rate_limit_waits_longer_and_keeps_the_model(workspace, monkeypatch):
 
     assert waits[:2] == [10, 20]
     assert asked[:3] == [agent.MEDIUM_MODEL] * 3
+
+
+# ---- The database starter template (team mode) ----
+
+@pytest.mark.parametrize("role", ["builder", "tester"])
+@pytest.mark.parametrize("path", ["app/db.py", "tests/conftest.py", "./app/db.py", "app/../tests/conftest.py"])
+def test_template_plumbing_is_protected_from_both_agents(tmp_path, role, path):
+    result = agent.make_tools(LocalExecutor(tmp_path), role)["write_file"](path, "x = 1")
+
+    assert result.startswith("REFUSED") and "setup" in result
+
+
+def test_database_files_are_hidden_from_the_agents(tmp_path):
+    executor = LocalExecutor(tmp_path)
+    executor.write_file("app/main.py", "x = 1")
+    executor.write_file("app.db", "pretend this is binary")
+
+    assert agent.make_tools(executor)["list_files"]() == "app/main.py"
+
+
+def test_team_mode_seeding_keeps_the_test_setup_but_no_tests(tmp_path):
+    executor = LocalExecutor(tmp_path)
+
+    agent.seed_workspace(executor, include_tests=False, template=agent.TEMPLATE_DB)
+
+    files = executor.list_files()
+    assert "tests/conftest.py" in files and "app/db.py" in files and "app/models.py" in files
+    assert not [f for f in files if f.startswith("tests/test_")]
+
+
+def test_database_template_gives_each_test_a_working_client(tmp_path):
+    """The template's own plumbing works end to end: the client fixture loads, and the app answers."""
+    executor = LocalExecutor(tmp_path)
+    agent.seed_workspace(executor, include_tests=False, template=agent.TEMPLATE_DB)
+    executor.write_file("tests/test_smoke.py", "def test_unknown_route_is_404(client):\n"
+                                               "    assert client.get('/nope').status_code == 404\n")
+
+    exit_code, output = executor.run([executor.python, "-m", "pytest", "-q", "-p", "no:cacheprovider"])
+
+    assert exit_code == 0, output
+
+
+def test_database_template_explains_how_to_run_itself(tmp_path):
+    executor = LocalExecutor(tmp_path)
+    agent.seed_workspace(executor, include_tests=False, template=agent.TEMPLATE_DB)
+
+    assert "uvicorn app.main:app" in executor.read_file("README.md")
+    assert "sqlalchemy==2.1.6" in executor.read_file("requirements.txt")
+    assert agent.make_tools(executor, "builder")["write_file"]("requirements.txt", "requests").startswith("REFUSED")

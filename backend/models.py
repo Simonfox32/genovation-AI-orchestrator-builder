@@ -1,6 +1,6 @@
 from sqlalchemy.orm import DeclarativeBase, mapped_column, Mapped, relationship
 from datetime import datetime, timezone
-from sqlalchemy import String, Text, DateTime, CheckConstraint, ForeignKey, Integer
+from sqlalchemy import JSON, String, Text, DateTime, CheckConstraint, ForeignKey, Integer
 import uuid
 
 class Base(DeclarativeBase):
@@ -16,6 +16,9 @@ class Project(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     summary: Mapped[str | None] = mapped_column(Text())  # Filled in by the orchestrator; empty until then
     optimization: Mapped[str] = mapped_column(String(20), server_default="balanced")
+    # Every file of the generated project, {path: text}, saved when an agent run ends (the sandbox is then
+    # destroyed). Empty for v1 projects and runs that crashed. Served as a zip by GET /projects/{id}/download.
+    artifact: Mapped[dict | None] = mapped_column(JSON())
 
     # Python-side link to this project's tasks (no column). Deleting a project deletes its tasks;
     # passive_deletes lets the database's ON DELETE CASCADE do it instead of loading every task first.
@@ -25,6 +28,11 @@ class Project(Base):
         cascade="all, delete-orphan",
         passive_deletes=True,
     )
+
+    @property
+    def downloadable(self) -> bool:
+        """Whether the whole generated project was saved (see `artifact`) and can be downloaded as a zip."""
+        return bool(self.artifact)
 
     @property
     def files(self) -> list[dict]:

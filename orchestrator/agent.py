@@ -40,7 +40,13 @@ def model_for(optimization):
     return MODELS_BY_OPTIMIZATION.get(optimization, MODEL)
 
 
-TEMPLATE = Path(__file__).parent / "agent_template"  # the starter app + its tests (the requirements)
+TEMPLATE = Path(__file__).parent / "agent_template"        # in-memory todo app + its built-in tests (ORCHESTRATOR=agent)
+TEMPLATE_DB = Path(__file__).parent / "agent_template_db"  # FastAPI + SQLite/SQLAlchemy starter (ORCHESTRATOR=agent-team)
+
+# The database template's plumbing. Agents may read these files but never change them: getting them subtly wrong
+# breaks every test (see the C1c experiment: foreign keys off, or no StaticPool).
+# requirements.txt lists what the sandbox can actually run: the sandbox has no network to install anything else.
+PROTECTED = {"app/db.py", "tests/conftest.py", "requirements.txt"}
 
 SYSTEM_PROMPT = """You are the backend developer on a small team, working on a Python FastAPI project.
 Your job: make every test in tests/ pass.
@@ -52,6 +58,29 @@ Your job: make every test in tests/ pass.
 
 START_MESSAGE = "Make the tests in tests/ pass."
 
+BUILDER_DB_PROMPT = """You are the backend developer on a small team, working on a FastAPI project with a SQLite
+database through SQLAlchemy 2. Your job: make every test in tests/ pass.
+- Read the tests first: they are the requirements. tests/REQUIREMENTS.md explains them in plain English.
+- Also read app/db.py and tests/conftest.py: they set up the database and the test client. Never change them, or
+  anything else in tests/.
+- Database models go in app/models.py: SQLAlchemy 2 classes inheriting from `Base` (from app.db), written with
+  `Mapped[...]` and `mapped_column(...)`. Let the database enforce rules where it can:
+  - ForeignKey(..., ondelete="CASCADE") where deleting a parent must delete its children. If you also define a
+    relationship() on the parent, give it cascade="all, delete-orphan", passive_deletes=True.
+  - unique=True or UniqueConstraint(...) for "no duplicates" rules; check before inserting (or catch
+    IntegrityError and roll back) so a duplicate returns 409, not a crash.
+- Validate input in the Pydantic schemas: Field(min_length=1) does NOT reject "   ", so strip blank text in a
+  field_validator; Literal[...] for fixed sets of values; Field(ge=0) for numbers that can't be negative.
+- Endpoints get a database session ONLY through `db: Session = Depends(get_db)` (get_db from app.db). Never create
+  sessions or engines yourself: the tests swap get_db for a fresh test database.
+- Keep `from app import models`, `Base.metadata.create_all(engine)` and `app = FastAPI()` in app/main.py.
+- Split the code sensibly: models in app/models.py, request/response shapes (Pydantic) in app/schemas.py,
+  endpoints in app/main.py.
+- Write real, general code. Never special-case the exact values the tests use.
+- Use only FastAPI, Pydantic, SQLAlchemy and the Python standard library (requirements.txt lists what's installed;
+  don't change it): no files, processes, network or environment access.
+- Run the tests after every change, and fix what fails. You're done only when all tests pass."""
+
 TESTER_PROMPT = """You are the tester on a small team. A product owner describes a backend; before any code exists,
 you write its requirements as pytest tests that a developer will then make pass. You may only write files in tests/.
 
@@ -59,10 +88,20 @@ Work in two steps.
 
 STEP 1: turn the request into a proper system. Requests are often vague ("a grocery store with transactions");
 your job is to expand them into what a real system of that kind needs. Write tests/REQUIREMENTS.md:
-- A numbered list of requirements, one per line, in plain English, most important first, 10 to 18 of them:
+- A numbered list of requirements, one per line, in plain English, most important first, 12 to 22 of them:
   - the things to store, including the ones a real system of this kind needs even if the request didn't name
     them (e.g. a store needs products with server-side prices and stock; a transaction references products)
-  - the actions on them (create, list, fetch, and domain actions like pay, refund, cancel)
+  - the BASICS, for every kind of thing stored, so they are never missing. One requirement per kind of thing,
+    e.g. "3. Tasks can be created in a project, fetched by id, listed per project, and reassigned":
+      - create it, fetch one by id, and list them, including listing children through their parent
+        (e.g. a project's tasks, a task's comments, a workspace's members)
+      - change every field the request implies can change (e.g. reassigning a task), and delete where it makes sense
+  - VALIDATION, as its own requirements: required text fields reject empty or blank values ("" and "   ") with 422;
+    numbers that can't be negative reject negatives with 422; values from a fixed set (like a status) reject
+    anything else with 422
+  - NO DUPLICATES, as its own requirement wherever something must be unique (e.g. the same member twice in one
+    workspace): the duplicate is rejected with 409
+  - the domain actions (like pay, refund, cancel)
   - the business rules that make it correct (e.g. "the server computes totals from product prices",
     "a purchase can't exceed stock", "a refund restores stock")
   - the edge cases of those rules, each as its OWN numbered requirement, because bugs hide there. Think like
@@ -70,32 +109,34 @@ your job is to expand them into what a real system of that kind needs. Write tes
       - the same item twice in one request (e.g. 3 + 3 of a product with stock 5 must be rejected, as 6 > 5)
       - exact boundaries (buying exactly the remaining stock succeeds; one more fails)
       - doing an action twice (refunding twice), or in the wrong state (refunding a cancelled order)
+      - getting around a rule through a different endpoint (e.g. CREATING a task directly as "done" when status
+        may only move todo -> doing -> done: new things must start in their first state)
       - one user's data never showing up in another user's results
       - a rejected request changes nothing (stock and totals stay as they were)
-  - errors: unknown ids return 404, invalid input returns 422
+  - errors: unknown ids return 404, invalid input returns 422, duplicates return 409
 - Then a section "## Assumptions" listing, one per line, what you added or decided that the request didn't say.
 Stay within the domain: no generic extras like a root or health endpoint.
 
 STEP 2: write tests/test_app.py with a separate test for each requirement. Put the requirement's number in the
-test's name: `def test_r3_order_reduces_stock():` covers requirement 3. A test may cover at most 2 requirements
-(e.g. `test_r4_r12_...`), so one failing check never hides another.
-- Use `from fastapi.testclient import TestClient`, `from app.main import app`, `client = TestClient(app)`.
-  The app will be a FastAPI app in app/main.py. Import nothing else from app/.
+test's name: `def test_r3_order_reduces_stock(client):` covers requirement 3. A test may cover at most 2
+requirements (e.g. `test_r4_r12_...`), so one failing check never hides another.
+- Every test takes the `client` fixture, provided by tests/conftest.py (read it; never change it). Don't create your
+  own TestClient, and import nothing from app/. The app will be a FastAPI app backed by a database.
 - You decide the API: paths, JSON fields and status codes. Make it consistent and unambiguous; a developer
   will implement exactly what the tests demand, and nothing else.
 - Check behaviour, not just status codes: assert on the returned JSON fields and on what changed afterwards
   (e.g. fetch the product again and check its stock went down; check a total is the exact expected number).
 - No weak checks: not `len(items) >= 1` or `isinstance(x, list)` on their own. Check that the exact item
   you created is in the list, with the right values.
-- Data lives in memory. Tests must be independent: each test creates the data it needs, never assumes an id
-  is a specific number, and uses unique names so tests can't clash. Use whole numbers for money (cents).
+- Each test starts with a brand-new, empty database, so tests are independent: each test creates the data it
+  needs. Never assume an id is a specific number: read it from the response. Use whole numbers for money (cents).
 - No randomness, dates or times, files, network, environment variables or other libraries.
 
 When both files are written, run the tests: they should FAIL (nothing is built yet) but must load without errors.
 Then reply with a short summary of the API you specified."""
 
-# Code that an in-memory web API never needs. Refused in anything either agent writes, because AI-written code
-# runs on the server. A speed bump against prompt injection, not a sandbox (that's Story #124).
+# Code a generated web API never needs. Refused in anything either agent writes. With EXECUTOR=vercel the code
+# runs in a sandbox anyway; this is a second, weaker layer for when it doesn't (local runs).
 # Patterns are word-aware so ordinary code passes: "/orders/1/process" is fine, "/proc/self/environ" is not;
 # "order_retrieval(" is fine, "eval(" is not.
 FORBIDDEN = (
@@ -142,6 +183,10 @@ TOOL_MENU = [list_files_tool, read_file_tool, write_file_tool, run_tests_tool]
 
 
 # ---- The real tools: plain Python, fenced to one workspace ----
+
+DATABASE_FILES = (".db", ".sqlite", ".sqlite3")  # binary files the agents shouldn't see or download
+
+
 def in_folder(path, folder):
     """Is the relative `path` inside `folder`? Decided from the text alone (no disk), so it works for any executor."""
     parts = Path(os.path.normpath(path)).parts
@@ -152,7 +197,9 @@ def make_tools(executor, role="builder"):
     """Build the agent's tools for one role. The RULES live here; the executor does the actual work, wherever it runs."""
 
     def list_files(folder="."):
-        return "\n".join(executor.list_files(folder)) or "(no files)"
+        # Hide database files: importing the app creates app.db, which is binary and useless to read.
+        files = [path for path in executor.list_files(folder) if not path.endswith(DATABASE_FILES)]
+        return "\n".join(files) or "(no files)"
 
     def read_file(path):
         return executor.read_file(path)
@@ -160,6 +207,8 @@ def make_tools(executor, role="builder"):
     def write_file(path, content):
         if os.path.isabs(path):
             return "REFUSED: use a path relative to the project, like app/main.py."
+        if os.path.normpath(path) in PROTECTED:
+            return f"REFUSED: {path} is part of the project's setup. Read it, but don't change it."
         in_tests = in_folder(path, "tests")
         if role == "builder" and in_tests:
             return "REFUSED: tests/ holds the requirements. Change the app code instead."
@@ -189,17 +238,18 @@ def make_tools(executor, role="builder"):
     return {"list_files": list_files, "read_file": read_file, "write_file": write_file, "run_tests": run_tests,
             "collect_tests": collect_tests}
 
-def seed_workspace(executor, include_tests=True):
-    """Put the starter app (and the built-in tests, unless the tester will write its own) into the workspace.
+def seed_workspace(executor, include_tests=True, template=TEMPLATE):
+    """Put a starter template into the workspace: its app files, its test setup (conftest.py), and its built-in
+    tests (tests/test_*.py) unless the tester will write its own.
 
     Goes through the executor, so it works wherever the workspace lives: a local folder or a remote sandbox.
     """
-    for source in sorted(TEMPLATE.rglob("*")):
-        if not source.is_file() or "__pycache__" in source.parts:
+    for source in sorted(template.rglob("*")):
+        if not source.is_file() or "__pycache__" in source.parts or source.name.endswith(DATABASE_FILES):
             continue
-        relative = source.relative_to(TEMPLATE).as_posix()  # e.g. "app/main.py"
-        if not include_tests and relative.startswith("tests/"):
-            continue
+        relative = source.relative_to(template).as_posix()  # e.g. "app/main.py"
+        if not include_tests and relative.startswith("tests/test_"):
+            continue  # skip the built-in tests only: tests/conftest.py is setup, and is always needed
         executor.write_file(relative, source.read_text())
 
 def tests_pass(output):
@@ -389,7 +439,8 @@ if __name__ == "__main__":
     started = time.time()
 
     with executor:  # a Vercel sandbox is destroyed when this block ends, even after an error
-        seed_workspace(executor, include_tests=not description)  # team mode: the tester writes the tests
+        # Team mode: the database starter, and the tester writes the tests. Otherwise: the todo app + built-in tests.
+        seed_workspace(executor, include_tests=not description, template=TEMPLATE_DB if description else TEMPLATE)
 
         if description:
             print("\n=== Tester ===")
@@ -400,10 +451,13 @@ if __name__ == "__main__":
                 sys.exit(1)
             print("\n=== Builder ===")
 
-        outcome = run_agent(workspace, on_step=print_step, max_steps=20 if description else 15, executor=executor)
+        outcome = run_agent(workspace, on_step=print_step, max_steps=25 if description else 15, executor=executor,
+                            system_prompt=BUILDER_DB_PROMPT if description else None)
 
         # Keep a local copy of the result: a Vercel sandbox (and its files) disappears when the block ends.
         for path in executor.list_files():
+            if path.endswith(DATABASE_FILES):
+                continue  # binary database file: not text, and not part of the code
             local = workspace / path
             local.parent.mkdir(parents=True, exist_ok=True)
             local.write_text(executor.read_file(path))

@@ -41,6 +41,7 @@ type BackendResult = {
   updated_at: string
   tasks: Task[]
   files?: GeneratedFile[]
+  downloadable?: boolean // true when GET /projects/{id}/download returns the whole project as a zip
   metrics?: {
     duration_seconds?: number
     tokens_used?: number
@@ -391,6 +392,12 @@ function App() {
 
             {/* Generated files from backend */}
             <h3>Generated Files</h3>
+
+            {mode === 'backend' && result.downloadable && (
+              <a className="download-btn" href={`${projectUrl(result.id)}/download`} download>
+                Download project (.zip)
+              </a>
+            )}
 
             {result.files && result.files.length > 0 ? (
               <div className="output-box">
