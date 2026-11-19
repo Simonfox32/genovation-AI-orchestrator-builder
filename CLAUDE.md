@@ -84,6 +84,11 @@ backend/.venv/bin/python orchestrator/sandbox/build_vercel_snapshot.py       # p
 
   There are at most `REVIEW_ROUNDS` (2) rounds. Dashboard rows: `Orchestrator · …`, `Tester (review n) · …`, `Builder (round n) · …`.
   `ORCHESTRATOR=agent` (our hand-written todo tests) has no reviewer, so its builder keeps its full step budget.
+- **No warnings:** `builder_done` requires all tests to pass with no pytest warnings (most come from deprecated names,
+  e.g. `status.HTTP_422_UNPROCESSABLE_ENTITY`). The builder is sent back `WARNING_NAGS` (2) times; after that, or at the
+  step limit, working code is accepted, and its warnings still show in the orchestrator's test run.
+- **Missing files:** every executor raises `FileNotFoundError` for a missing file (the sandbox translates Vercel's
+  `SandboxPathNotFoundError`). The `read_file` tool turns that into a plain `NOT FOUND: …` answer, not a red error.
 - **Download:** when an agent run ends, the whole workspace is saved in `projects.artifact` (JSON `{path: text}`, skipping
   `.db` files and `__pycache__`) before the sandbox is destroyed. `GET /projects/{id}/download` serves it as a zip
   (paths that would escape the folder are skipped: "zip slip"). `downloadable` in the API shows the dashboard's download button.

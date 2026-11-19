@@ -35,6 +35,7 @@ FALLBACK_MODEL = MEDIUM_MODEL  # used when the chosen model keeps failing (e.g. 
 # then broke 3 passing tests trying to satisfy it. So: stop a stuck builder early, and get the tests checked.
 STUCK_AFTER = 3     # builder test runs in a row without fewer failures than its best so far -> stop it
 REVIEW_ROUNDS = 2   # times the tester re-checks the failing tests and the builder tries again
+WARNING_NAGS = 2    # times a builder whose tests all pass is sent back to fix warnings; after that, accept the work
 REVIEW_STEPS = 10   # steps for one tester review (a real one, replaying 11-18's run, used 8: read, read, fix, test, fix)
 RETRY_STEPS = 15    # steps for each extra builder round (a fresh history, so it starts fast again)
 
@@ -61,7 +62,8 @@ Your job: make every test in tests/ pass.
 - Never change anything in tests/.
 - Write real, general code. Never special-case the exact values the tests use.
 - Keep data in memory. Use only FastAPI, Pydantic and plain Python: no files, processes, network or environment access.
-- Run the tests after every change, and fix what fails. You're done only when all tests pass."""
+- Run the tests after every change, and fix what fails. You're done only when all tests pass with no warnings
+  (pytest lists them; they usually mean a deprecated name, e.g. use status.HTTP_422_UNPROCESSABLE_CONTENT)."""
 
 START_MESSAGE = "Make the tests in tests/ pass."
 
@@ -91,7 +93,11 @@ database through SQLAlchemy 2. Your job: make every test in tests/ pass.
 - Write real, general code. Never special-case the exact values the tests use.
 - Use only FastAPI, Pydantic, SQLAlchemy and the Python standard library (requirements.txt lists what's installed;
   don't change it): no files, processes, network or environment access.
-- Run the tests after every change, and fix what fails. You're done only when all tests pass.
+- Run the tests after every change, and fix what fails. You're done only when all tests pass with NO warnings
+  (pytest lists them under "warnings summary"). Warnings usually mean a deprecated name, so use the current ones:
+  status.HTTP_422_UNPROCESSABLE_CONTENT or plain 422 (HTTP_422_UNPROCESSABLE_ENTITY is deprecated); Pydantic v2's
+  model_dump() and model_config = ConfigDict(from_attributes=True) (not .dict(), orm_mode or class Config);
+  datetime.now(timezone.utc) (not datetime.utcnow()).
 - Tests are written by a person, and can be wrong. If a test can't pass without breaking a numbered requirement or
   another test (e.g. it expects a purchase that requirement 8 says must be refused), don't bend the app to fit it:
   call report_test_problem with the test's name and the contradiction. A tester will check it. Never use it just
@@ -269,7 +275,11 @@ def make_tools(executor, role="builder"):
         return "\n".join(files) or "(no files)"
 
     def read_file(path):
-        return executor.read_file(path)
+        try:
+            return executor.read_file(path)
+        except FileNotFoundError:  # every executor raises this for a missing file
+            # Normal while exploring (e.g. app/schemas.py before anyone wrote it): say so plainly, not as an error.
+            return f"NOT FOUND: {path} doesn't exist yet. Use list_files to see the files, or write_file to create it."
 
     def write_file(path, content):
         if os.path.isabs(path):
@@ -363,12 +373,28 @@ class ProgressWatch:
 
 # ---- "Done" checks: our code decides when a role is finished, not the model ----
 
+def warning_count(output):
+    """How many warnings pytest's summary line reports: '20 passed, 4 warnings in 0.8s' -> 4."""
+    summary = output.strip().splitlines()[-1] if output.strip() else ""
+    match = re.search(r"(\d+) warnings?\b", summary)
+    return int(match.group(1)) if match else 0
+
+
+def only_warnings_left(output):
+    """Every test passes, but pytest still reports warnings."""
+    return tests_pass(output) and warning_count(output) > 0
+
+
 def builder_done(tools):
-    """Done when every test passes. Returns (done, test_output, message for the agent if not done)."""
+    """Done when every test passes with no warnings. Returns (done, test_output, message for the agent if not)."""
     output = tools["run_tests"]()
-    if tests_pass(output):
-        return True, output, ""
-    return False, output, "Not done: the tests still fail. Here is the output:\n" + output
+    if not tests_pass(output):
+        return False, output, "Not done: the tests still fail. Here is the output:\n" + output
+    if warning_count(output):
+        return False, output, (f"Not done: every test passes, but pytest shows {warning_count(output)} warning(s). "
+                               "Fix the code that causes them (usually a deprecated name: the output says which):\n"
+                               + output)
+    return True, output, ""
 
 
 def requirement_numbers(requirements_text):
@@ -410,11 +436,13 @@ def tests_are_sound(tools, min_tests=3):
     if count is None or count < min_tests:
         return False, collected, (f"Not done: tests/test_app.py must load without errors and contain at least "
                                   f"{min_tests} tests. pytest says:\n" + collected)
-    try:
-        requirements = tools["read_file"]("tests/REQUIREMENTS.md")
-        tests = tools["read_file"]("tests/test_app.py")
-    except (FileNotFoundError, ValueError) as error:
-        return False, collected, f"Not done: write both tests/REQUIREMENTS.md and tests/test_app.py ({error})."
+    requirements = tools["read_file"]("tests/REQUIREMENTS.md")
+    tests = tools["read_file"]("tests/test_app.py")
+    missing = [path for path, text in (("tests/REQUIREMENTS.md", requirements), ("tests/test_app.py", tests))
+               if text.startswith("NOT FOUND")]
+    if missing:
+        return False, collected, (f"Not done: write both tests/REQUIREMENTS.md and tests/test_app.py "
+                                  f"({' and '.join(missing)} doesn't exist yet).")
     if not requirement_numbers(requirements):
         return False, collected, "Not done: tests/REQUIREMENTS.md must list the requirements as numbered lines (1. ...)."
     missing = uncovered_requirements(requirements, tests)
@@ -518,6 +546,10 @@ def run_agent(workspace, on_step=None, model=MODEL, max_steps=15, system_prompt=
         return stopped(step, output, f"Stopped: no progress in {watch.limit} test runs, still failing "
                                      f"{', '.join(names)}", stuck=names)
 
+    # Warnings: the builder is sent back to fix them, but only WARNING_NAGS times. One it can't fix (say, caused by
+    # a test, which it may not edit) must not burn the whole budget: then the work is accepted, warnings and all.
+    warning_nags = 0
+
     for step in range(1, max_steps + 1):
         response = ask_model(history)
         history.append(response.candidates[0].content)
@@ -526,6 +558,10 @@ def run_agent(workspace, on_step=None, model=MODEL, max_steps=15, system_prompt=
         if not calls:
             # The model says it's finished. Don't take its word for it: check ourselves.
             done, output, feedback = done_check(tools)
+            if not done and done_check is builder_done and only_warnings_left(output):
+                if warning_nags >= WARNING_NAGS:
+                    done = True
+                warning_nags += 1
             if done:
                 return {"passed": True, "steps": step, "summary": response.text or "", "test_output": output,
                         "model": current["model"]}
@@ -555,6 +591,8 @@ def run_agent(workspace, on_step=None, model=MODEL, max_steps=15, system_prompt=
 
     # Out of steps. Check once more: the work may be done even though the agent never said so.
     done, output, _ = done_check(tools)
+    if not done and done_check is builder_done and only_warnings_left(output):
+        done = True  # every test passes; the warnings it didn't get to still show in the orchestrator's test run
     return {"passed": done, "steps": max_steps, "summary": "Stopped: hit the step limit", "test_output": output,
             "model": current["model"]}
 
