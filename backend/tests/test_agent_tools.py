@@ -422,6 +422,62 @@ def test_a_review_may_fix_tests_but_never_delete_them(tmp_path):
     assert not done and "at least 3 tests" in feedback
 
 
+# ---- Missing files and warnings ----
+
+def test_reading_a_missing_file_is_a_plain_answer_not_an_error(workspace):
+    # Normal while exploring: the builder reads app/schemas.py before anyone has written it.
+    result = agent.make_tools(LocalExecutor(workspace))["read_file"]("app/schemas.py")
+
+    assert result.startswith("NOT FOUND: app/schemas.py doesn't exist yet")
+    assert orchestration._step_status({"tool": "read_file", "result": result}) == "completed"  # not a red row
+
+
+def test_tester_is_told_to_write_a_missing_requirements_file(tmp_path):
+    executor = LocalExecutor(tmp_path)
+    agent.seed_workspace(executor, include_tests=False, template=agent.TEMPLATE_DB)
+    executor.write_file("tests/test_app.py", "".join(f"def test_r{n}_x(client):\n    assert False\n\n\n" for n in (1, 2, 3)))
+
+    done, _, feedback = agent.tester_done(agent.make_tools(executor, "tester"))
+
+    assert not done and "tests/REQUIREMENTS.md doesn't exist yet" in feedback
+
+
+def project_answering_422_with(tmp_path, status_name):
+    """A tiny database-template project whose one endpoint refuses with status.<status_name>, and its test."""
+    executor = LocalExecutor(tmp_path)
+    agent.seed_workspace(executor, include_tests=False, template=agent.TEMPLATE_DB)
+    executor.write_file("app/main.py", (
+        "from fastapi import FastAPI, HTTPException, status\n\nfrom app import models\nfrom app.db import Base, engine\n\n"
+        "Base.metadata.create_all(engine)\napp = FastAPI()\n\n\n@app.get('/refuse')\ndef refuse():\n"
+        f"    raise HTTPException(status_code=status.{status_name}, detail='no')\n"))
+    executor.write_file("tests/test_app.py",
+                        "def test_r1_refuse(client):\n    assert client.get('/refuse').status_code == 422\n")
+    return executor
+
+
+def test_builder_is_not_done_while_pytest_shows_warnings(tmp_path):
+    # Seen 11-18: "20 passed, 4 warnings", all from the deprecated status.HTTP_422_UNPROCESSABLE_ENTITY.
+    deprecated = project_answering_422_with(tmp_path / "old", "HTTP_422_UNPROCESSABLE_ENTITY")
+    done, output, feedback = agent.builder_done(agent.make_tools(deprecated))
+
+    assert agent.tests_pass(output) and agent.warning_count(output) == 1
+    assert not done and "1 warning(s)" in feedback
+
+    current = project_answering_422_with(tmp_path / "new", "HTTP_422_UNPROCESSABLE_CONTENT")
+    assert agent.builder_done(agent.make_tools(current))[0]
+
+
+def test_warnings_send_the_builder_back_twice_then_its_work_is_accepted(tmp_path, monkeypatch):
+    # A warning it can't fix (say, from a test it may not edit) must not burn the whole step budget.
+    executor = project_answering_422_with(tmp_path, "HTTP_422_UNPROCESSABLE_ENTITY")
+    fake_gemini(monkeypatch, lambda turn: [])  # says "done" every time, changing nothing
+
+    outcome = agent.run_agent(tmp_path, max_steps=10, executor=executor, system_prompt=agent.BUILDER_DB_PROMPT)
+
+    assert outcome["passed"] is True
+    assert outcome["steps"] == 3  # sent back about the warnings twice, accepted the third time
+
+
 def test_prompts_cover_missing_parents():
     # Nov 18 bug: creating a character in a faction that doesn't exist came back as 409 "already exists". The builder
     # turned EVERY IntegrityError into 409 (a missing parent raises one too), and no test tried a missing parent,

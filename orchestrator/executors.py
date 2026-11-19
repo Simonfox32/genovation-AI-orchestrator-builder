@@ -142,10 +142,18 @@ class SandboxExecutor(LocalExecutor):
         return self.root if normalized == "." else f"{self.root}/{normalized}"
 
     def list_files(self, folder="."):
+        from vercel.sandbox import SandboxPathNotFoundError
+
         files, folders = [], [self._path(folder)]
         while folders:  # walk the folder tree, one listdir call (= one network request) per folder
             current = folders.pop()
-            for entry in self.box.fs.listdir(current):
+            try:
+                entries = self.box.fs.listdir(current)
+            except SandboxPathNotFoundError:
+                if current == self._path(folder):
+                    return []  # a folder that doesn't exist has no files: same as LocalExecutor
+                raise
+            for entry in entries:
                 full = f"{current}/{entry.path}"
                 if entry.kind == "directory" and entry.path != "__pycache__":
                     folders.append(full)
@@ -154,7 +162,14 @@ class SandboxExecutor(LocalExecutor):
         return sorted(files)
 
     def read_file(self, path):
-        return self.box.fs.read_text(self._path(path))
+        from vercel.sandbox import SandboxPathNotFoundError
+
+        try:
+            return self.box.fs.read_text(self._path(path))
+        except SandboxPathNotFoundError:
+            # Raise what LocalExecutor raises, so callers handle "no such file" one way, whatever the executor.
+            # (Before this, a tester that forgot REQUIREMENTS.md crashed tester_done in the sandbox.)
+            raise FileNotFoundError(f"No such file: {path}") from None
 
     def write_file(self, path, content):
         full = self._path(path)
