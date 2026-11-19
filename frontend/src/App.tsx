@@ -41,7 +41,7 @@ type BackendResult = {
   updated_at: string
   tasks: Task[]
   files?: GeneratedFile[]
-  downloadable?: boolean // true when GET /projects/{id}/download returns the whole project as a zip
+  downloadable?: boolean // true when backend supports GET /projects/{id}/download
   metrics?: {
     duration_seconds?: number
     tokens_used?: number
@@ -136,6 +136,9 @@ function projectUrl(id: string): string {
 }
 
 function App() {
+  const [menuOpen, setMenuOpen] = useState(false)
+  const [activeTab, setActiveTab] = useState<'home' | 'history' | 'settings' | 'projects' | 'help'>('home')
+
   // User inputs
   // (Preferred model and "include tests" controls are hidden until the orchestrator uses them)
   const [prompt, setPrompt] = useState('')
@@ -267,6 +270,46 @@ function App() {
 
   return (
     <div className="app">
+      <div className="topbar">
+        <button
+          type="button"
+          className="menu-toggle"
+          aria-label={menuOpen ? 'Close navigation menu' : 'Open navigation menu'}
+          aria-expanded={menuOpen}
+          aria-controls="app-navigation"
+          onClick={() => setMenuOpen(open => !open)}
+        >
+          <span /><span /><span />
+        </button>
+        <span className="topbar-brand"><span className="brand-mark">G</span> GENOVATION <span className="brand-subtitle">/ AI STUDIO</span></span>
+        <span className="topbar-status"><span className="status-dot" /> Workspace</span>
+      </div>
+
+      {menuOpen && <button type="button" className="nav-backdrop" aria-label="Close menu" onClick={() => setMenuOpen(false)} />}
+      <aside id="app-navigation" className={`side-nav ${menuOpen ? 'side-nav-open' : ''}`} aria-hidden={!menuOpen}>
+        <div className="nav-caption">WORKSPACE</div>
+        {([
+          ['home', '⌂', 'Home'],
+          ['history', '◷', 'History'],
+          ['projects', '▦', 'Projects'],
+          ['settings', '⚙', 'Settings'],
+          ['help', '?', 'Help & Support'],
+        ] as const).map(([tab, symbol, title]) => (
+          <button
+            type="button"
+            key={tab}
+            className={`nav-item ${activeTab === tab ? 'nav-item-active' : ''}`}
+            tabIndex={menuOpen ? 0 : -1}
+            onClick={() => { setActiveTab(tab); setMenuOpen(false) }}
+          >
+            <span className="nav-icon" aria-hidden="true">{symbol}</span><span>{title}</span>
+            {tab !== 'home' && <span className="nav-soon">SOON</span>}
+          </button>
+        ))}
+        <div className="nav-footer">GENOVATION AI <span>·</span> Preview workspace</div>
+      </aside>
+
+      {activeTab === 'home' ? <>
       <header className="header">
         <h1>AI Orchestrator</h1>
         <p>Build software using multiple AI models</p>
@@ -441,6 +484,17 @@ function App() {
           </section>
         )}
       </main>
+      </> : (
+        <main className="container placeholder-container">
+          <section className="card placeholder-card">
+            <div className="placeholder-icon">{activeTab === 'history' ? '◷' : activeTab === 'settings' ? '⚙' : activeTab === 'projects' ? '▦' : '?'}</div>
+            <span className="eyebrow">WORKSPACE / {activeTab.toUpperCase()}</span>
+            <h1>{activeTab === 'history' ? 'History' : activeTab === 'settings' ? 'Settings' : activeTab === 'projects' ? 'Projects' : 'Help & Support'}</h1>
+            <p>This section is a placeholder for future functionality. Your project builder is unchanged.</p>
+            <button type="button" className="generate-btn back-home" onClick={() => setActiveTab('home')}>Back to Project Builder</button>
+          </section>
+        </main>
+      )}
     </div>
   )
 }
