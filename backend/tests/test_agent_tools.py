@@ -1,4 +1,5 @@
 """Tests for the agents' tools and done-checks (orchestrator/agent.py). Real files and real pytest; no Gemini."""
+import os
 import re
 import shutil
 
@@ -69,7 +70,7 @@ def test_tools_only_use_the_executor_interface():
     assert tools["list_files"]() == "app/main.py"
     assert tools["read_file"]("app/main.py") == "x = 1"
     assert tools["run_tests"]().endswith("1 failed in 0.1s")
-    assert executor.commands[0][:3] == ["python", "-m", "pytest"]
+    assert executor.commands[0][:4] == ["python", "-B", "-m", "pytest"]
 
 
 def test_paths_outside_the_workspace_are_refused(workspace):
@@ -420,6 +421,180 @@ def test_a_review_may_fix_tests_but_never_delete_them(tmp_path):
     executor.write_file("tests/test_app.py", three.replace("def test_r3_x(client):\n    assert True\n", ""))
     done, _, feedback = agent.review_done(tools, min_tests=3)
     assert not done and "at least 3 tests" in feedback
+
+
+CONTRADICTION_REQUIREMENTS = "1. The total is 600\n2. The total endpoint answers 200\n3. The total stays 600\n"
+CONTRADICTION_TESTS = (
+    "def test_r1_total(client):\n    assert client.get('/total').json() == 600\n\n\n"
+    "def test_r2_answers(client):\n    assert client.get('/total').status_code == 200\n\n\n"
+    "def test_r3_total_stays(client):\n    assert client.get('/total').json() == 300\n"
+)
+
+
+def contradicting_project(tmp_path):
+    """A working app (total 600) whose test_r3 contradicts requirement 3 by expecting 300."""
+    executor = LocalExecutor(tmp_path)
+    agent.seed_workspace(executor, include_tests=False, template=agent.TEMPLATE_DB)
+    executor.write_file("app/main.py", (
+        "from fastapi import FastAPI\n\nfrom app import models\nfrom app.db import Base, engine\n\n"
+        "Base.metadata.create_all(engine)\napp = FastAPI()\n\n\n@app.get('/total')\ndef total():\n    return 600\n"))
+    executor.write_file("tests/REQUIREMENTS.md", CONTRADICTION_REQUIREMENTS)
+    executor.write_file("tests/test_app.py", CONTRADICTION_TESTS)
+    return executor
+
+
+def disputed_outcome(executor):
+    return {"passed": False, "steps": 5, "summary": "Reported", "test_output": agent.make_tools(executor)["run_tests"](),
+            "disputed": {"test": "test_r3_total_stays", "reason": "requirement 3 says 600"}}
+
+
+@pytest.mark.parametrize("target, first, second", [
+    ("tests/test_x.py", "def test_x():\n    assert 1 == 2\n", "def test_x():\n    assert 2 == 2\n"),
+    ("value.py", "VALUE = 1\n", "VALUE = 2\n"),
+])
+def test_a_same_size_edit_is_never_hidden_by_stale_bytecode(tmp_path, target, first, second):
+    # Found Nov 22: Vercel Sandbox gives every written file mtime 0, and Python reuses a .pyc whose source has the same
+    # mtime and size. So changing 1 to 2 kept running the OLD code, for tests and for the generated app alike.
+    executor = LocalExecutor(tmp_path)
+
+    def write(path, content):
+        executor.write_file(path, content)
+        os.utime(tmp_path / path, (0, 0))  # what the sandbox does
+
+    if target == "value.py":
+        write("tests/test_x.py", "from value import VALUE\n\n\ndef test_x():\n    assert VALUE == 2\n")
+    write(target, first)
+    tools = agent.make_tools(executor)
+    assert not agent.tests_pass(tools["run_tests"]())
+
+    write(target, second)
+
+    assert agent.tests_pass(tools["run_tests"]())
+
+
+def test_a_review_that_only_says_a_test_is_wrong_is_not_a_decision(tmp_path, monkeypatch):
+    # Real run, Nov 22: the tester wrote "fixed: ... is wrong" without changing the test, and the builder was then told
+    # the tests were right. A verdict in words must not count as a decision.
+    executor = contradicting_project(tmp_path)
+    fake_gemini(monkeypatch, lambda turn: [])  # only ever answers in words
+    told = []
+    real_retry = agent.retry_message
+    monkeypatch.setattr(agent, "retry_message", lambda *args: told.append(real_retry(*args)) or told[-1])
+
+    final = agent.review_rounds(tmp_path, executor, disputed_outcome(executor), rounds=1)
+
+    assert final["passed"] is False
+    assert executor.read_file("tests/test_app.py") == CONTRADICTION_TESTS
+    assert "the tests are right" not in told[0]
+    assert "didn't finish" in told[0]
+
+
+FIXED_R3 = "def test_r3_total_stays(client):\n    assert client.get('/total').json() == 600\n"
+
+
+def test_fix_test_changes_only_the_test_under_review(tmp_path):
+    executor = contradicting_project(tmp_path)
+    writes = []
+    decisions = agent.ReviewDecisions(executor, ["test_r3_total_stays"], min_tests=3, on_write=writes.append)
+
+    result = decisions.fix_test("tests/test_app.py::test_r3_total_stays", FIXED_R3, "requirement 3 says 600")
+
+    assert result == "FIXED: test_r3_total_stays"
+    assert executor.read_file("tests/test_app.py") == CONTRADICTION_TESTS.replace("== 300", "== 600")
+    assert decisions.complete and decisions.fixed == ["test_r3_total_stays"] and not decisions.upheld
+    assert "requirement 3 says 600" in decisions.verdict
+    assert writes[0]["tool"] == "write_file" and writes[0]["args"]["path"] == "tests/test_app.py"  # the dashboard's files
+    assert agent.tests_pass(agent.make_tools(executor)["run_tests"]())
+
+
+@pytest.mark.parametrize("test, new_code", [
+    ("test_r1_total", FIXED_R3),  # not under review
+    ("test_r3_total_stays", "def test_r3_total_stays(:\n"),  # doesn't parse
+    ("test_r3_total_stays", FIXED_R3.replace("test_r3_total_stays", "test_r3_renamed")),  # renamed
+    ("test_r3_total_stays", FIXED_R3 + "\n\ndef test_r9_extra(client):\n    assert client.get('/total').json() == 600\n"),
+    ("test_r3_total_stays", "import json\n" + FIXED_R3),  # more than the one function
+    ("test_r3_total_stays", "def test_r3_total_stays(client):\n    assert True\n"),  # checks nothing
+    ("test_r3_total_stays", "def test_r3_total_stays(client):\n    client.get('/total')\n"),  # check removed
+    ("test_r3_total_stays", "def test_r3_total_stays(client):\n    assert client.get('/total').json() == 300\n"),  # same
+    ("test_r3_total_stays", "def test_r3_total_stays(client):\n    assert eval('600') == 600\n"),  # code guard
+])
+def test_fix_test_refuses_anything_but_a_real_correction(tmp_path, test, new_code):
+    executor = contradicting_project(tmp_path)
+    decisions = agent.ReviewDecisions(executor, ["test_r3_total_stays"], min_tests=3)
+
+    assert decisions.fix_test(test, new_code, "x").startswith("REFUSED")
+
+    assert executor.read_file("tests/test_app.py") == CONTRADICTION_TESTS
+    assert not decisions.complete
+
+
+def test_upholding_a_test_needs_a_reason_and_changes_nothing(tmp_path):
+    executor = contradicting_project(tmp_path)
+    decisions = agent.ReviewDecisions(executor, ["test_r3_total_stays"], min_tests=3)
+
+    comparison = {"test_expects": "300", "requirement_says": "300", "test_agrees_with_requirement": True}
+
+    assert decisions.uphold_test("test_r3_total_stays", "   ", **comparison).startswith("REFUSED")
+    assert decisions.uphold_test("test_r3_total_stays", "the code is wrong", test_expects="", requirement_says="300",
+                                 test_agrees_with_requirement=True).startswith("REFUSED")
+    assert not decisions.complete
+    assert decisions.uphold_test("test_r3_total_stays", "the code must return 300",
+                                 **comparison) == "UPHELD: test_r3_total_stays"
+    assert decisions.complete and decisions.upheld == ["test_r3_total_stays"] and not decisions.fixed
+    assert decisions.fix_test("test_r3_total_stays", FIXED_R3, "changed my mind").startswith("REFUSED")
+    assert executor.read_file("tests/test_app.py") == CONTRADICTION_TESTS
+
+
+def test_a_test_that_disagrees_with_its_requirement_cannot_be_upheld(tmp_path):
+    # Real run, Nov 22: the reviewer wrote "this test contradicted Requirement 8", then called uphold_test anyway.
+    executor = contradicting_project(tmp_path)
+    decisions = agent.ReviewDecisions(executor, ["test_r3_total_stays"], min_tests=3)
+
+    result = decisions.uphold_test("test_r3_total_stays", "must be 600", test_expects="300", requirement_says="600",
+                                   test_agrees_with_requirement=False)
+
+    assert result.startswith("REFUSED") and "fix_test" in result
+    assert not decisions.complete
+    assert decisions.fix_test("test_r3_total_stays", FIXED_R3, "requirement 3 says 600").startswith("FIXED")
+
+
+def test_a_review_that_fixes_the_test_finishes_the_project(tmp_path, monkeypatch):
+    executor = contradicting_project(tmp_path)
+    configs = fake_gemini(monkeypatch, lambda turn: [("fix_test", {
+        "test": "test_r3_total_stays", "new_code": FIXED_R3, "reason": "requirement 3 says 600"})])
+
+    final = agent.review_rounds(tmp_path, executor, disputed_outcome(executor), rounds=1)
+
+    assert final["passed"] is True
+    assert len(configs) == 1  # the decision ended the review: no extra model call and no builder round
+    assert final["reviews"][0]["fixed"] == ["test_r3_total_stays"]
+    assert {"fix_test", "uphold_test"} <= set(offered_tools(configs[0]))
+    assert "write_file" not in offered_tools(configs[0])
+
+
+def test_a_reviewer_cannot_write_files_directly(tmp_path, monkeypatch):
+    executor = contradicting_project(tmp_path)
+    decisions = agent.ReviewDecisions(executor, ["test_r3_total_stays"], min_tests=3)
+    fake_gemini(monkeypatch, lambda turn: [("write_file", {"path": "tests/test_app.py", "content": "def test_x():\n    pass\n"})])
+    steps = []
+
+    outcome = agent.run_agent(tmp_path, on_step=steps.append, max_steps=1, role="tester", executor=executor,
+                              system_prompt=agent.REVIEWER_PROMPT, done_check=decisions.done, review=decisions)
+
+    assert steps[0]["result"].startswith("ERROR")  # the tool doesn't exist in a review
+    assert outcome["passed"] is False
+    assert executor.read_file("tests/test_app.py") == CONTRADICTION_TESTS  # checked before any undo could hide a write
+
+
+def test_dashboard_names_review_decisions():
+    fixed = {"tool": "fix_test", "args": {"test": "test_r3", "reason": "wrong total"}, "result": "FIXED: test_r3"}
+    upheld = {"tool": "uphold_test", "args": {"test": "test_r3", "reason": "code is wrong"}, "result": "UPHELD: test_r3"}
+    refused = {"tool": "fix_test", "args": {"test": "test_r3"}, "result": "REFUSED: keep every check"}
+
+    assert orchestration._describe_step(fixed) == ("Fixed test_r3", "wrong total")
+    assert orchestration._describe_step(upheld) == ("Upheld test_r3", "code is wrong")
+    assert orchestration._describe_step(refused)[0] == "Could not record a decision on test_r3"
+    assert orchestration._step_status(refused) == "failed"
 
 
 # ---- Missing files and warnings ----

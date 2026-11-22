@@ -325,7 +325,14 @@ def _review_note(reviews: list) -> str:
     """One sentence on the feedback loop for the summary, e.g. ' Feedback loop: the tester corrected test_r10_x.'"""
     if not reviews:
         return ""
-    verdicts = [f"{'corrected' if r['changed'] else 'upheld'} {', '.join(r['tests'])}" for r in reviews]
+    verdicts = []
+    for review in reviews:
+        parts = []
+        if review["fixed"]:
+            parts.append(f"corrected {', '.join(review['fixed'])}")
+        if review["upheld"]:
+            parts.append(f"upheld {', '.join(review['upheld'])}")
+        verdicts.append(" and ".join(parts) or f"could not finish reviewing {', '.join(review['tests'])}")
     return f" Feedback loop: the tester re-checked the failing tests and {'; then '.join(verdicts)}."
 
 
@@ -340,6 +347,11 @@ def _describe_step(event) -> tuple[str, str]:
         return "Listed the project files", result
     if tool == "run_tests":
         return f"Ran the tests: {_last_line(result)}", result[-2000:]
+    if tool in ("fix_test", "uphold_test"):
+        test = args.get("test", "?")
+        if result.startswith(("REFUSED", "ERROR")):
+            return f"Could not record a decision on {test}", result[:2000]
+        return f"{'Fixed' if tool == 'fix_test' else 'Upheld'} {test}", str(args.get("reason", ""))[:2000]
     return tool, result[:2000]
 
 

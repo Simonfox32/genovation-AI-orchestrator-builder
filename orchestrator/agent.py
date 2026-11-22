@@ -9,9 +9,11 @@ Used two ways:
   - from the terminal: backend/.venv/bin/python orchestrator/agent.py                  (builder, fixed tests)
                        backend/.venv/bin/python orchestrator/agent.py "a store with orders"  (tester, then builder)
 """
+import ast
 import os
 import re
 import sys
+import textwrap
 import time
 from datetime import datetime
 from pathlib import Path
@@ -187,13 +189,14 @@ buys a 300-credit ship with 200 credits and expects the purchase to go through, 
 the character can't afford is refused.
 
 - Read tests/REQUIREMENTS.md and the failing tests. Read app/ too if it helps you see what the code does.
-- If a test is wrong: fix it in tests/test_app.py (and fix REQUIREMENTS.md if the requirement itself was unclear).
-  Keep its name (test_r<n>_...) and keep it checking its requirement: correct the mistake, never delete the check
-  or weaken it until anything passes.
-- If a test is right: change nothing. The code is wrong.
-- Touch only the tests you were asked about. Run the tests when you're done.
-- Finish with your verdict in one or two sentences: for each test, "fixed: <what was wrong>" or "correct: <what the
-  code gets wrong>". The developer reads your verdict next."""
+- For each test, compare what its failing assert expects with what the requirements say should happen.
+- If they DISAGREE, the TEST is wrong, however clear the requirement is: call fix_test with its name, the complete
+  corrected function, and what was wrong. Keep its name (test_r<n>_...) and keep it checking its requirement:
+  correct the mistake, never delete the check or weaken it until anything passes.
+- If they AGREE, the CODE is wrong: call uphold_test with what the test expects, what the requirement says, and what
+  the code gets wrong. A developer's complaint is not evidence: check it against the requirements yourself.
+- Make one of those two calls for every test you were asked about. Saying a test is wrong in a message changes
+  nothing: only fix_test changes a test. The developer reads the reasons you give."""
 
 
 def review_message(failing, test_output, dispute=None):
@@ -202,14 +205,19 @@ def review_message(failing, test_output, dispute=None):
     if dispute:
         lines.append(f"The developer says {dispute['test']} is wrong: \"{dispute['reason']}\"")
     lines.append(f"The latest test output:\n{test_output[-3000:]}")
-    lines.append("Check each of these tests against tests/REQUIREMENTS.md and the other tests, then give your verdict.")
+    lines.append("Check each of these tests against tests/REQUIREMENTS.md and the other tests, then call fix_test or "
+                 "uphold_test for each one.")
     return "\n\n".join(lines)
 
 
-def retry_message(failing, verdict, tests_changed):
+def retry_message(failing, verdict, tests_changed, decided=True):
     """The builder's first message in an extra round: what the tester decided about the tests it was stuck on."""
-    change = ("The tester corrected the tests: read tests/test_app.py again." if tests_changed
-              else "The tester says the tests are right, so the code must change.")
+    if tests_changed:
+        change = "The tester corrected the tests: read tests/test_app.py again."
+    elif decided:
+        change = "The tester says the tests are right, so the code must change."
+    else:
+        change = "Nobody has confirmed whether these tests are right."
     return (f"You worked on this project before, but these tests kept failing: {', '.join(failing)}.\n"
             f"{change} The tester's verdict: {verdict or '(none given)'}\n\n"
             "The files are as you left them. Read what you need, then make every test pass.")
@@ -251,8 +259,32 @@ report_test_problem_tool = types.FunctionDeclaration(
         "reason": {"type": "string", "description": "The contradiction, citing requirement numbers."}},
         "required": ["test", "reason"]},
 )
+fix_test_tool = types.FunctionDeclaration(
+    name="fix_test",
+    description=("The test under review is wrong: replace it with a corrected version. Every other test stays exactly "
+                 "as it is."),
+    parameters_json_schema={"type": "object", "properties": {
+        "test": {"type": "string", "description": "The test function's name, e.g. 'test_r10_dispatch'."},
+        "new_code": {"type": "string", "description": "The complete corrected function, with the same name."},
+        "reason": {"type": "string", "description": "What was wrong, citing requirement numbers."}},
+        "required": ["test", "new_code", "reason"]},
+)
+uphold_test_tool = types.FunctionDeclaration(
+    name="uphold_test",
+    description=("Use only when the failing test's expected result AGREES with the requirements, so the code must "
+                 "change. Leaves the test as it is. If they disagree, call fix_test instead."),
+    parameters_json_schema={"type": "object", "properties": {
+        "test": {"type": "string", "description": "The test function's name, e.g. 'test_r10_dispatch'."},
+        "test_expects": {"type": "string", "description": "The exact result the failing assert expects."},
+        "requirement_says": {"type": "string", "description": "What the numbered requirement says should happen here."},
+        "test_agrees_with_requirement": {"type": "boolean",
+                                         "description": "True only if test_expects and requirement_says match."},
+        "reason": {"type": "string", "description": "What the code gets wrong, citing requirement numbers."}},
+        "required": ["test", "test_expects", "requirement_says", "test_agrees_with_requirement", "reason"]},
+)
 TOOL_MENU = [list_files_tool, read_file_tool, write_file_tool, run_tests_tool]
 REVIEWABLE_TOOL_MENU = TOOL_MENU + [report_test_problem_tool]  # a builder whose tests a tester can re-check (team mode)
+REVIEW_TOOL_MENU = [list_files_tool, read_file_tool, run_tests_tool, fix_test_tool, uphold_test_tool]  # no write_file
 
 
 # ---- The real tools: plain Python, fenced to one workspace ----
@@ -299,7 +331,9 @@ def make_tools(executor, role="builder"):
         return f"Wrote {path} ({len(content)} characters)"
 
     def pytest(*extra):
-        exit_code, output = executor.run([executor.python, "-m", "pytest", "-q", "-p", "no:cacheprovider", *extra],
+        # -B: never cache bytecode. Vercel Sandbox gives every written file mtime 0, and Python reuses a .pyc whose source
+        # has the same mtime and size, so a same-size edit (1 -> 2) would silently keep running the old code.
+        exit_code, output = executor.run([executor.python, "-B", "-m", "pytest", "-q", "-p", "no:cacheprovider", *extra],
                                          timeout=60)
         if exit_code is None:  # the executor stopped it: it ran too long
             return "TIMEOUT: the tests took longer than 60 seconds."
@@ -478,7 +512,7 @@ def review_done(tools, min_tests):
 # ---- The agent loop ----
 
 def run_agent(workspace, on_step=None, model=MODEL, max_steps=15, system_prompt=None,
-              role="builder", start_message=None, executor=None, reviewable=False, done_check=None):
+              role="builder", start_message=None, executor=None, reviewable=False, done_check=None, review=None):
     """Run one agent (role "builder" or "tester") in `workspace` until its done-check passes or `max_steps` runs out.
 
     on_step(event) is called after every tool call with
@@ -486,6 +520,8 @@ def run_agent(workspace, on_step=None, model=MODEL, max_steps=15, system_prompt=
     reviewable=True (a builder in team mode, where a tester can re-check the tests): the builder may call
     report_test_problem, and is stopped early when it stops making progress (see ProgressWatch).
     done_check(tools) -> (done, output, feedback) replaces the role's usual check (a tester's review uses this).
+    review=ReviewDecisions (a tester's review): swaps write_file for fix_test and uphold_test, and ends the run as
+    soon as every test under review is decided.
     Returns {"passed": bool, "steps": int, "summary": str, "test_output": str, "model": the model that finished},
     plus "stuck": [test names] if it was stopped for making no progress, or "disputed": {"test", "reason"} if it
     reported a test.
@@ -505,10 +541,15 @@ def run_agent(workspace, on_step=None, model=MODEL, max_steps=15, system_prompt=
 
     executor = executor or LocalExecutor(workspace)  # where the work happens; local unless told otherwise
     tools = make_tools(executor, role=role)
-    
+    menu = REVIEWABLE_TOOL_MENU if reviewable else TOOL_MENU
+    if review:
+        del tools["write_file"]  # a review changes tests only through fix_test, one test at a time
+        tools.update(fix_test=review.fix_test, uphold_test=review.uphold_test)
+        menu = REVIEW_TOOL_MENU
+
     config = types.GenerateContentConfig(
         system_instruction=system_prompt,
-        tools=[types.Tool(function_declarations=REVIEWABLE_TOOL_MENU if reviewable else TOOL_MENU)],
+        tools=[types.Tool(function_declarations=menu)],
         automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
     )
 
@@ -589,6 +630,13 @@ def run_agent(workspace, on_step=None, model=MODEL, max_steps=15, system_prompt=
                 id=call.id, name=call.name, response={"result": result})))
         history.append(types.Content(role="user", parts=results))
 
+        if review and review.complete:  # every test under review has a decision: the review is over
+            done, output, feedback = done_check(tools)
+            if done:
+                return {"passed": True, "steps": step, "summary": review.verdict, "test_output": output,
+                        "model": current["model"]}
+            history.append(types.Content(role="user", parts=[types.Part(text=feedback)]))
+
     # Out of steps. Check once more: the work may be done even though the agent never said so.
     done, output, _ = done_check(tools)
     if not done and done_check is builder_done and only_warnings_left(output):
@@ -603,6 +651,125 @@ def snapshot_tests(executor):
     """The tester's files, {path: text}: everything in tests/ a review may change (conftest.py is protected)."""
     return {path: executor.read_file(path) for path in executor.list_files("tests")
             if "__pycache__" not in path and not path.endswith(DATABASE_FILES) and path not in PROTECTED}
+
+
+TESTS_FILE = "tests/test_app.py"
+
+
+def replace_test(source, name, new_code):
+    """`source` with the test function `name` replaced by `new_code`. Returns (new_source, problem); one is None.
+
+    Requiring the tester to act makes it tempting to "fix" a test by gutting it, so a fix must keep the test's name and
+    its number of checks, and can't assert a constant (`assert True` checks nothing).
+    """
+    new_code = textwrap.dedent(new_code).strip()
+    try:
+        replacement = ast.parse(new_code).body
+    except SyntaxError as error:
+        return None, f"that code doesn't parse: {error.msg}."
+    if len(replacement) != 1 or not isinstance(replacement[0], ast.FunctionDef) or replacement[0].name != name:
+        return None, f"send exactly one complete function named {name}, and nothing else."
+    new = replacement[0]
+    old = next((node for node in ast.parse(source).body if isinstance(node, ast.FunctionDef) and node.name == name), None)
+    if old is None:
+        return None, f"{name} isn't a top-level test in {TESTS_FILE}."
+    if ast.dump(new) == ast.dump(old):
+        return None, "that is the same test. If the test is right, call uphold_test instead."
+    old_checks = [node for node in ast.walk(old) if isinstance(node, ast.Assert)]
+    new_checks = [node for node in ast.walk(new) if isinstance(node, ast.Assert)]
+    if len(new_checks) < len(old_checks):
+        return None, f"keep every check: the test had {len(old_checks)} assert(s), and this has {len(new_checks)}."
+    if any(isinstance(check.test, ast.Constant) for check in new_checks):
+        return None, "an assert on a constant checks nothing."
+    first = old.decorator_list[0].lineno if old.decorator_list else old.lineno
+    lines = source.splitlines()
+    lines[first - 1:old.end_lineno] = new_code.splitlines()
+    return "\n".join(lines) + "\n", None
+
+
+class ReviewDecisions:
+    """What one tester review decided. Every test under review must end up fixed (the test was wrong, and really
+    changed) or upheld (the test is right, so the code must change).
+
+    Seen 11-22: reviewers wrote "fixed: this test is wrong" without changing it, and the builder was then told the
+    tests were right. So a decision is a tool call our code can check, never a sentence.
+    """
+
+    def __init__(self, executor, tests, min_tests, on_write=None):
+        self.executor, self.tests, self.min_tests, self.on_write = executor, list(tests), min_tests, on_write
+        self.rules = make_tools(executor, "tester")  # the tester's write rules and code guard still apply
+        self.decided = {}  # test name -> (was it fixed?, reason)
+
+    @property
+    def complete(self):
+        return all(test in self.decided for test in self.tests)
+
+    @property
+    def fixed(self):
+        return [test for test in self.tests if test in self.decided and self.decided[test][0]]
+
+    @property
+    def upheld(self):
+        return [test for test in self.tests if test in self.decided and not self.decided[test][0]]
+
+    @property
+    def verdict(self):
+        return " ".join(f"{test}: the test was wrong and is now fixed ({reason or 'no reason given'})." if was_fixed
+                        else f"{test}: the test is right, so the code must change ({reason})."
+                        for test, (was_fixed, reason) in self.decided.items())
+
+    def _refusal(self, test):
+        if test not in self.tests:
+            return f"REFUSED: {test} isn't under review. The tests under review are: {', '.join(self.tests)}."
+        if test in self.decided:
+            return f"REFUSED: {test} is already decided."
+        return None
+
+    def fix_test(self, test, new_code, reason=""):
+        test = str(test).split("::")[-1].strip()
+        refusal = self._refusal(test)
+        if refusal:
+            return refusal
+        before = self.executor.read_file(TESTS_FILE)
+        fixed, problem = replace_test(before, test, str(new_code))
+        if problem:
+            return f"REFUSED: {problem}"
+        wrote = self.rules["write_file"](TESTS_FILE, fixed)  # applies the code guard
+        if wrote.startswith("REFUSED"):
+            return wrote
+        sound, _, feedback = tests_are_sound(self.rules, min_tests=self.min_tests)
+        if not sound:
+            self.executor.write_file(TESTS_FILE, before)
+            return f"REFUSED: that change was undone because it breaks the tests. {feedback}"
+        if self.on_write:  # logged like a write, so the dashboard's files show what's really there
+            self.on_write({"step": 0, "tool": "write_file", "args": {"path": TESTS_FILE, "content": fixed},
+                           "result": f"Wrote {TESTS_FILE}"})
+        self.decided[test] = (True, str(reason).strip())
+        return f"FIXED: {test}"
+
+    def uphold_test(self, test, reason="", test_expects="", requirement_says="", test_agrees_with_requirement=False):
+        test = str(test).split("::")[-1].strip()
+        refusal = self._refusal(test)
+        if refusal:
+            return refusal
+        # Seen 11-22: reviewers wrote "this test contradicts requirement 8" and then upheld it. Making them state the
+        # comparison turns that slip into something our code can refuse.
+        if test_agrees_with_requirement is not True:
+            return (f"REFUSED: you said {test} disagrees with the requirements, so the test is wrong. Call fix_test with "
+                    "the corrected function.")
+        reason = str(reason).strip()
+        if not reason or not str(test_expects).strip() or not str(requirement_says).strip():
+            return "REFUSED: say what the test expects, what the requirement says, and what the code gets wrong."
+        self.decided[test] = (False, reason)
+        return f"UPHELD: {test}"
+
+    def done(self, tools):
+        """The review's done-check: every test decided, and the tests still sound."""
+        if not self.complete:
+            left = [test for test in self.tests if test not in self.decided]
+            return False, "", (f"Not done: decide {', '.join(left)}. Call fix_test if a test is wrong, or uphold_test "
+                               "if the code is. Saying so in a message changes nothing.")
+        return review_done(tools, self.min_tests)
 
 
 def review_rounds(workspace, executor, outcome, model=MODEL, step_logger=None, on_note=None, rounds=REVIEW_ROUNDS):
@@ -635,16 +802,15 @@ def review_rounds(workspace, executor, outcome, model=MODEL, step_logger=None, o
 
         before = snapshot_tests(executor)
         min_tests = collected_count(make_tools(executor, "tester")["collect_tests"]()) or 3  # a review may not delete tests
-        review = run_agent(workspace, on_step=logger(f"Tester (review {round_number}) · ", "tester"), model=model,
+        label = f"Tester (review {round_number}) · "
+        decisions = ReviewDecisions(executor, failing, min_tests, on_write=logger(label, "tester"))
+        review = run_agent(workspace, on_step=logger(label, "tester"), model=model,
                            max_steps=REVIEW_STEPS, system_prompt=REVIEWER_PROMPT, role="tester", executor=executor,
                            start_message=review_message(failing, outcome["test_output"], dispute),
-                           done_check=lambda tools: review_done(tools, min_tests))
-        if review["passed"]:
-            changed, verdict = snapshot_tests(executor) != before, review["summary"].strip()
-            if verdict.startswith("Stopped:"):  # out of steps before it said anything: don't pass that on as a verdict
-                verdict = ("The tester ran out of steps before explaining; see what changed in tests/test_app.py."
-                           if changed else "The tester found nothing to change in the tests.")
-        else:  # it left the tests broken or short: put them back exactly as they were
+                           done_check=decisions.done, review=decisions)
+        if review["passed"] and decisions.complete:
+            fixed, upheld, verdict = decisions.fixed, decisions.upheld, decisions.verdict
+        else:  # it didn't decide every test, or left them broken: put them back exactly as they were
             undo = logger(f"Tester (review {round_number}, undone) · ", "tester")
             for path in snapshot_tests(executor):
                 content = before.get(path, "")  # a file it added is emptied (executors can't delete)
@@ -652,9 +818,10 @@ def review_rounds(workspace, executor, outcome, model=MODEL, step_logger=None, o
                 if undo:  # logged like a write, so the dashboard's files show what's really there
                     undo({"step": 0, "tool": "write_file", "args": {"path": path, "content": content},
                           "result": f"Restored {path}"})
-            changed, verdict = False, "The review didn't finish, so the tests were left as they were."
-        reviews.append({"round": round_number, "tests": failing, "changed": changed, "verdict": verdict,
-                        "model": review.get("model", model)})
+            fixed, upheld, verdict = [], [], "The review didn't finish, so the tests were left as they were."
+        changed = bool(fixed)
+        reviews.append({"round": round_number, "tests": failing, "changed": changed, "fixed": fixed, "upheld": upheld,
+                        "verdict": verdict, "model": review.get("model", model)})
 
         output = make_tools(executor, "builder")["run_tests"]()  # our own check, not the tester's word
         if tests_pass(output):
@@ -665,7 +832,8 @@ def review_rounds(workspace, executor, outcome, model=MODEL, step_logger=None, o
 
         outcome = run_agent(workspace, on_step=logger(f"Builder (round {round_number + 1}) · ", "builder"),
                             model=model, max_steps=RETRY_STEPS, system_prompt=BUILDER_DB_PROMPT, executor=executor,
-                            start_message=retry_message(failing, verdict, changed), reviewable=True)
+                            start_message=retry_message(failing, verdict, changed, bool(fixed or upheld)),
+                            reviewable=True)
         steps += outcome["steps"]
 
     return {**outcome, "steps": steps, "reviews": reviews}
