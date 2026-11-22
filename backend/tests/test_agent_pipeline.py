@@ -446,7 +446,8 @@ def scripted_team(calls, *acts):
     def run_agent(workspace, on_step=None, role="builder", start_message=None, executor=None, **kwargs):
         calls.append({"role": role, "start_message": start_message, "system_prompt": kwargs.get("system_prompt"),
                       "reviewable": kwargs.get("reviewable")})
-        return queue.pop(0)(executor, on_step)
+        act = queue.pop(0)
+        return act(executor, on_step, kwargs["review"]) if kwargs.get("review") else act(executor, on_step)
     return run_agent
 
 
@@ -475,11 +476,16 @@ def builder_returning(total):
     return act
 
 
-def reviewer(verdict, fix_to=None):
-    def act(executor, on_step):
+def reviewer(reason, fix_to=None):
+    """A tester review that decides test_r2_total through the real ReviewDecisions."""
+    def act(executor, on_step, review):
         if fix_to is not None:
-            write(executor, on_step, "tests/test_app.py", loop_tests(fix_to))
-        return {"passed": True, "steps": 2, "summary": verdict, "test_output": ""}
+            corrected = f"def test_r2_total(client):\n    assert client.get('/total').json() == {fix_to}\n"
+            assert review.fix_test("test_r2_total", corrected, reason).startswith("FIXED")
+        else:
+            assert review.uphold_test("test_r2_total", reason, test_expects="600", requirement_says="600",
+                                      test_agrees_with_requirement=True).startswith("UPHELD")
+        return {"passed": True, "steps": 2, "summary": review.verdict, "test_output": ""}
     return act
 
 
@@ -549,7 +555,7 @@ def test_a_review_that_breaks_the_tests_is_undone(monkeypatch):
     monkeypatch.setenv("ORCHESTRATOR", "agent-team")
     calls = []
 
-    def breaks_the_tests(executor, on_step):
+    def breaks_the_tests(executor, on_step, review):
         write(executor, on_step, "tests/test_app.py", "def test_r1_list(:\n")  # doesn't even load
         return {"passed": False, "steps": 8, "summary": "Stopped: hit the step limit", "test_output": ""}
 
@@ -571,15 +577,20 @@ def test_a_review_that_breaks_the_tests_is_undone(monkeypatch):
 
 
 def test_a_review_that_runs_out_of_steps_still_gives_the_builder_something_useful(monkeypatch):
-    # Seen in a real review (replaying 11-18's run): it used every step fixing the test and never wrote a verdict.
+    # Seen in a real review (replaying 11-18's run): it used every step and never reached a decision.
     monkeypatch.setenv("ORCHESTRATOR", "agent-team")
     calls = []
-    monkeypatch.setattr(orchestration.agent, "run_agent", scripted_team(
-        calls, writes_tests_expecting(600), builder_returning(300),
-        reviewer("Stopped: hit the step limit"), builder_returning(600)))
 
-    submit("A store")
+    def runs_out_of_steps(executor, on_step, review):
+        return {"passed": False, "steps": 10, "summary": "Stopped: hit the step limit", "test_output": ""}
+
+    monkeypatch.setattr(orchestration.agent, "run_agent", scripted_team(
+        calls, writes_tests_expecting(600), builder_returning(300), runs_out_of_steps, builder_returning(600)))
+
+    project = submit("A store")
 
     retry = calls[3]["start_message"]
     assert "Stopped: hit the step limit" not in retry
-    assert "The tester found nothing to change in the tests." in retry
+    assert "the tests are right" not in retry  # nobody decided that
+    assert "The review didn't finish" in retry
+    assert "could not finish reviewing test_r2_total" in project["summary"]
