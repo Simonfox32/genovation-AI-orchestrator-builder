@@ -119,6 +119,8 @@ Tests never call Gemini: `tests/conftest.py` removes these variables; tests that
   (`.env*` is ignored; grep staged diffs for keys). Don't stage unrelated stray edits.
 - **No AI attribution in git:** commit messages and PR descriptions must not contain `Co-Authored-By: Claude …`,
   `Claude-Session: …` or "Generated with Claude Code" lines. This overrides Claude Code's default attribution.
+  Commits are authored as Simon: if `git config user.name` says Claude (cloud sessions do), first run
+  `git config user.name SimonFox32` and `git config user.email 145519422+Simonfox32@users.noreply.github.com`.
 - **Ownership:** don't rework Fill's frontend or Anula's orchestrator without agreement. Small fixes are fine when Simon asks for them.
 - **Taiga:** write each story out in chat for Simon's approval *before* creating it.
 - **Honesty:** don't claim something works unless it was run and checked. Prove tests can fail (break the code on
