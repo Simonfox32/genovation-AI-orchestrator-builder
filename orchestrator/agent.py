@@ -546,7 +546,8 @@ def run_agent(workspace, on_step=None, model=MODEL, max_steps=15, system_prompt=
 
     # Created here, not at import time, so importing this file never needs a key. The timeout matters: without it,
     # a model that never answers (seen with the strong model under load) hangs the run forever and no fallback starts.
-    conversation = model_client.start_conversation(system_prompt, menu, start_message, timeout_ms=REQUEST_TIMEOUT_MS)
+    conversation = model_client.start_conversation(model, system_prompt, menu, start_message,
+                                                   timeout_ms=REQUEST_TIMEOUT_MS)
 
     current = {"model": model}  # a dict so ask_model can change it (switch to the fallback model)
 
@@ -563,13 +564,15 @@ def run_agent(workspace, on_step=None, model=MODEL, max_steps=15, system_prompt=
             except Exception as error:
                 rate_limited = "429" in str(error) or "RESOURCE_EXHAUSTED" in str(error)
                 wait = attempt * (10 if rate_limited else 3)
-                print(f"   (Gemini error on {current['model']}, retrying in {wait}s: {str(error)[:60]})")
-                if not rate_limited and current["model"] != FALLBACK_MODEL:
+                print(f"   (Model error on {current['model']}, retrying in {wait}s: {str(error)[:60]})")
+                # The history is in one provider's format, so a fallback only works within the same provider.
+                if (not rate_limited and current["model"] != FALLBACK_MODEL
+                        and model_client.same_provider(current["model"], FALLBACK_MODEL)):
                     print(f"   (switching to the fallback model {FALLBACK_MODEL})")
                     current["model"] = FALLBACK_MODEL
                 if attempt < MAX_ATTEMPTS:
                     time.sleep(wait)
-        raise RuntimeError(f"Gemini unavailable after {MAX_ATTEMPTS} attempts")
+        raise RuntimeError(f"{current['model']} unavailable after {MAX_ATTEMPTS} attempts")
 
     def stopped(step, output, summary, **extra):
         return {"passed": False, "steps": step, "summary": summary, "test_output": output,
@@ -607,6 +610,8 @@ def run_agent(workspace, on_step=None, model=MODEL, max_steps=15, system_prompt=
         for call in calls:
             args = call.args
             try:
+                if call.error:  # the model's arguments were unreadable: tell it, and don't run the tool
+                    raise ValueError(call.error)
                 result = str(tools[call.name](**args))
             except Exception as error:
                 result = f"ERROR: {type(error).__name__}: {error}"

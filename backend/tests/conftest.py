@@ -15,9 +15,10 @@ load_dotenv()
 
 os.environ["DEMO_STEP_DELAY_SECONDS"] = "0"  # No artificial delay in tests
 
-# Tests never call the real Gemini API, even if a developer's .env has a key: use the sample plan
+# Tests never call a real AI provider, even if a developer's .env has keys: use the sample plan
 # and the simulated tools. Tests that need an LLM pass in a fake one.
-os.environ.pop("GEMINI_API_KEY", None)
+for provider_key in ("GEMINI_API_KEY", "OPENAI_API_KEY", "GROQ_API_KEY", "OPEN_ROUTER_API_KEY", "CEREBRAS_API_KEY"):
+    os.environ.pop(provider_key, None)
 os.environ.pop("ROUTER_TOOLS", None)
 
 os.environ.pop("ORCHESTRATOR", None)  

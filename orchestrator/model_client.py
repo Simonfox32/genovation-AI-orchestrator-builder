@@ -2,21 +2,54 @@
 
 The agent loop (agent.py) only ever does this:
 
-    chat = start_conversation(system_prompt, tools, first_message, timeout_ms=60_000)
-    reply = chat.record(chat.send("some-model"))    # reply.text, reply.calls
+    chat = start_conversation("groq/openai/gpt-oss-120b", system_prompt, tools, first_message, timeout_ms=60_000)
+    reply = chat.record(chat.send("groq/openai/gpt-oss-120b"))    # reply.text, reply.calls
     chat.add_tool_results([(call, "what the tool returned"), ...])
     chat.add_text("Not done: 2 tests still fail.")
 
+A model name is "provider/model". A bare name, like "gemini-3.5-flash-lite", means Gemini.
+OpenRouter can serve one model from many hosts: "openrouter/vendor/model@deepinfra" pins it to one host.
+
 Each provider formats messages and tool calls differently, so each gets a small conversation class that translates
 to and from these neutral shapes. Adding a provider means adding a class here, with no change to the agent loop.
+Providers that copy OpenAI's chat format only need one line in OPENAI_STYLE.
 
 send() and record() are separate so a failed request can be retried without touching the conversation.
 This file isn't called models.py because backend/models.py already owns that import name.
 """
+import json
+import os
 from dataclasses import dataclass
 
+import httpx2
 from google import genai
 from google.genai import types
+
+# provider -> (API base URL, the environment variable holding its key)
+OPENAI_STYLE = {
+    "openai": ("https://api.openai.com/v1", "OPENAI_API_KEY"),
+    "groq": ("https://api.groq.com/openai/v1", "GROQ_API_KEY"),
+    "openrouter": ("https://openrouter.ai/api/v1", "OPEN_ROUTER_API_KEY"),
+    "cerebras": ("https://api.cerebras.ai/v1", "CEREBRAS_API_KEY"),
+}
+OPENROUTER_MAX_OUTPUT = 16_000  # most tokens one reply may use: limits a runaway reply's cost on a prepaid key
+
+
+def split_model(name):
+    """'groq/openai/gpt-oss-120b' -> ('groq', 'openai/gpt-oss-120b'). Only the first slash counts, because some
+    providers' model ids contain slashes of their own."""
+    provider, slash, model = name.partition("/")
+    if not slash:
+        return "gemini", name
+    if provider != "gemini" and provider not in OPENAI_STYLE:
+        raise ValueError(f"Unknown model provider '{provider}' in '{name}'")
+    if not model:
+        raise ValueError(f"No model named after the provider in '{name}'")
+    return provider, model
+
+
+def same_provider(first, second):
+    return split_model(first)[0] == split_model(second)[0]
 
 
 @dataclass(frozen=True)
@@ -29,10 +62,12 @@ class ToolSpec:
 
 @dataclass(frozen=True)
 class ToolCall:
-    """The model asking us to run one tool. `id` links the result back to this call."""
+    """The model asking us to run one tool. `id` links the result back to this call. `error` means its arguments
+    couldn't be read, so the tool must not run and the model should be told why."""
     id: str | None
     name: str
     args: dict
+    error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -56,7 +91,8 @@ class GeminiConversation:
 
     def send(self, model):
         """One request to the model. Raises if it fails, leaving the conversation unchanged."""
-        return self._client.models.generate_content(model=model, contents=self._history, config=self._config)
+        return self._client.models.generate_content(model=split_model(model)[1], contents=self._history,
+                                                    config=self._config)
 
     def record(self, response):
         """Add the model's turn to the conversation and return it in the neutral shape."""
@@ -77,6 +113,93 @@ class GeminiConversation:
         self._history.append(types.Content(role="user", parts=[types.Part(text=text)]))
 
 
-def start_conversation(system_prompt, tools, first_message, timeout_ms):
-    """Open a conversation with the configured provider. Gemini is the only one so far."""
-    return GeminiConversation(system_prompt, tools, first_message, timeout_ms)
+def _read_tool_call(raw):
+    """OpenAI-style tool arguments arrive as JSON text, and models sometimes write it badly."""
+    function = raw["function"]
+    arguments = function.get("arguments") or "{}"
+    try:
+        args = json.loads(arguments) if isinstance(arguments, str) else arguments
+    except json.JSONDecodeError:
+        args = None
+    if not isinstance(args, dict):
+        return ToolCall(id=raw.get("id"), name=function["name"], args={},
+                        error="The tool arguments were not a valid JSON object")
+    return ToolCall(id=raw.get("id"), name=function["name"], args=args)
+
+
+class OpenAIStyleConversation:
+    """OpenAI's chat format, which Groq, OpenRouter, Cerebras and many others also speak."""
+
+    def __init__(self, provider, system_prompt, tools, first_message, timeout_ms):
+        base_url, key_name = OPENAI_STYLE[provider]
+        self._key = os.getenv(key_name)
+        if not self._key:
+            raise RuntimeError(f"{key_name} is not set, so {provider} models can't be used")
+        self._provider = provider
+        self._url = f"{base_url}/chat/completions"
+        self._timeout = timeout_ms / 1000
+        self._tools = [{"type": "function", "function": {"name": tool.name, "description": tool.description,
+                                                         "parameters": tool.parameters}} for tool in tools]
+        self._messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": first_message}]
+
+    def _failure(self, status, text):
+        """An error that keeps the status (the retry logic reads it) and can never contain the key."""
+        return RuntimeError(f"{status} from {self._provider}: {text.replace(self._key, '[key]')[:300]}")
+
+    def _request_body(self, model):
+        name = split_model(model)[1]
+        body = {"model": name, "messages": self._messages, "tools": self._tools}
+        if self._provider == "openrouter":
+            name, _, host = name.partition("@")
+            routing = {"require_parameters": True}  # without this, a host that lacks tool calling can still be chosen
+            if host:
+                routing.update(order=[host], allow_fallbacks=False)
+            body.update(model=name, provider=routing, max_tokens=OPENROUTER_MAX_OUTPUT)
+        return body
+
+    def send(self, model):
+        """One request to the model. Raises if it fails, leaving the conversation unchanged."""
+        response = httpx2.post(self._url, headers={"Authorization": f"Bearer {self._key}"}, timeout=self._timeout,
+                               json=self._request_body(model))
+        if response.status_code != 200:
+            raise self._failure(response.status_code, response.text)
+        data = response.json()
+        # OpenRouter can answer 200 with an error at the top level, or on the choice next to partial content.
+        choices = data.get("choices") or []
+        error = data.get("error") or (choices[0].get("error") if choices else None)
+        if error or not choices:
+            raise self._failure(response.status_code, json.dumps(error) if error else response.text)
+        return data
+
+    def record(self, response):
+        """Add the model's turn to the conversation and return it in the neutral shape."""
+        message = response["choices"][0]["message"]
+        turn = {"role": "assistant", "content": message.get("content") or ""}
+        if message.get("reasoning_details"):  # OpenRouter needs these back; other private reasoning stays out
+            turn["reasoning_details"] = message["reasoning_details"]
+        calls, sent_back = [], []
+        for raw in message.get("tool_calls") or []:
+            call = _read_tool_call(raw)
+            calls.append(call)
+            # Providers can reject a history containing broken or empty argument text.
+            usable = not call.error and raw["function"].get("arguments")
+            sent_back.append(raw if usable else {**raw, "function": {**raw["function"], "arguments": "{}"}})
+        if sent_back:
+            turn["tool_calls"] = sent_back
+        self._messages.append(turn)
+        return ModelReply(text="" if calls else turn["content"], calls=calls)
+
+    def add_tool_results(self, results):
+        """results: [(ToolCall, result text), ...], one message per tool call."""
+        self._messages.extend({"role": "tool", "tool_call_id": call.id, "content": result} for call, result in results)
+
+    def add_text(self, text):
+        self._messages.append({"role": "user", "content": text})
+
+
+def start_conversation(model, system_prompt, tools, first_message, timeout_ms):
+    """Open a conversation with whichever provider runs `model`."""
+    provider, _ = split_model(model)
+    if provider == "gemini":
+        return GeminiConversation(system_prompt, tools, first_message, timeout_ms)
+    return OpenAIStyleConversation(provider, system_prompt, tools, first_message, timeout_ms)
