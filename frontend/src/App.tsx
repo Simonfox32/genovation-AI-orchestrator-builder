@@ -1,500 +1,192 @@
-
-import { useEffect, useState, type FormEvent } from 'react'
+import { useEffect, useRef, useState, type FormEvent } from 'react'
+import { Sidebar } from './components/Sidebar'
+import { HomePage } from './pages/HomePage'
+import { HistoryPage } from './pages/HistoryPage'
+import { ProjectsPage } from './pages/ProjectsPage'
+import { SettingsPage } from './pages/SettingsPage'
+import { HelpPage } from './pages/HelpPage'
+import { useWorkspace } from './hooks/useWorkspace'
+import { API_BASE_URL, ApiError, createProject, fetchProject, POLL_INTERVAL_MS, MAX_PROMPT_LENGTH } from './services/projectApi'
+import type { BackendResult, Optimization, Tab } from './types/project'
+import { isInProgress, readStorage } from './utils/workspace'
 import './App.css'
 
-// 1. Define the JSON structure we send to the backend (POST /projects)
-type Optimization = 'balanced' | 'speed' | 'quality'
+const ACTIVE_KEY = `genovation-active-project-v1:${API_BASE_URL}`
+const RETRY_INTERVAL_MS = 5000
 
-type ProjectRequest = {
-  description: string
-  optimization: Optimization
-}
-
-// 2. Define the JSON structure expected from the backend (GET /projects/{id})
-type Status = 'pending' | 'running' | 'completed' | 'failed'
-
-type Task = {
-  id: string
-  position: number
-  name: string
-  description: string | null
-  tool: string | null
-  status: Status
-  attempts: number
-  output: string | null
-}
-
-// Not produced by the backend yet; kept so the UI is ready when they are added
-type GeneratedFile = {
-  path: string
-  description?: string
-  content?: string
-}
-
-type BackendResult = {
-  id: string
-  description: string
-  status: Status
-  optimization: Optimization
-  summary: string | null
-  created_at: string
-  updated_at: string
-  tasks: Task[]
-  files?: GeneratedFile[]
-  downloadable?: boolean // true when backend supports GET /projects/{id}/download
-  metrics?: {
-    duration_seconds?: number
-    tokens_used?: number
-  }
-}
-
-// Backend location: set VITE_API_BASE_URL in frontend/.env.local; defaults to the local backend
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
-
-// How often to re-check a project that is still being processed
-const POLL_INTERVAL_MS = 2000
-
-function isInProgress(status: string): boolean {
-  return status === 'pending' || status === 'running'
-}
-
-// Check whether the JSON has the expected basic structure
-function isBackendResult(data: unknown): data is BackendResult {
-  if (typeof data !== 'object' || data === null) {
-    return false
-  }
-
-  const value = data as Record<string, unknown>
-
-  return (
-    typeof value.id === 'string' &&
-    typeof value.status === 'string' &&
-    Array.isArray(value.tasks)
-  )
-}
-
-// Turn one FastAPI validation error ({loc, msg}) into "field: message"
-function describeValidationError(item: unknown): string {
-  if (typeof item !== 'object' || item === null) {
-    return String(item)
-  }
-
-  const { loc, msg } = item as { loc?: unknown[]; msg?: string }
-  const field = Array.isArray(loc) ? loc[loc.length - 1] : undefined
-
-  return field ? `${String(field)}: ${msg}` : msg ?? 'Invalid request'
-}
-
-// Use the backend's own error message ("detail") when there is one
-async function errorMessage(response: Response): Promise<string> {
-  try {
-    const body = (await response.json()) as { detail?: unknown }
-
-    if (typeof body.detail === 'string') {
-      return body.detail
-    }
-
-    if (Array.isArray(body.detail)) {
-      return body.detail.map(describeValidationError).join('; ')
-    }
-  } catch {
-    // Response body was not JSON; fall through to the generic message
-  }
-
-  return `Request failed: ${response.status}`
-}
-
-// Helper for retrieving JSON
-async function loadJson(
-  url: string,
-  options?: RequestInit
-): Promise<BackendResult> {
-  let response: Response
-
-  try {
-    response = await fetch(url, options)
-  } catch {
-    // fetch only throws when no response arrived at all (server down, wrong URL, or CORS)
-    throw new Error(`Could not reach ${url}. Is the backend running?`)
-  }
-
-  if (!response.ok) {
-    throw new Error(await errorMessage(response))
-  }
-
-  const json: unknown = await response.json()
-
-  if (!isBackendResult(json)) {
-    throw new Error('Unexpected backend JSON structure')
-  }
-
-  return json
-}
-
-function projectUrl(id: string): string {
-  return `${API_BASE_URL}/projects/${encodeURIComponent(id)}`
+function message(error: unknown) {
+  return error instanceof Error ? error.message : 'Something went wrong.'
 }
 
 function App() {
+  const { history, savedProjects, preferences, setPreferences, recordProject,
+    toggleSaved, removeFromHistory, clearHistory } = useWorkspace()
   const [menuOpen, setMenuOpen] = useState(false)
-  const [activeTab, setActiveTab] = useState<'home' | 'history' | 'settings' | 'projects' | 'help'>('home')
-
-  // User inputs
-  // (Preferred model and "include tests" controls are hidden until the orchestrator uses them)
+  const [activeTab, setActiveTab] = useState<Tab>('home')
   const [prompt, setPrompt] = useState('')
-  const [optimization, setOptimization] = useState<Optimization>('balanced')
-
-  // Data source: the real backend (at VITE_API_BASE_URL). Change to 'demo' to use the local sample JSON.
-  const [mode] = useState<'demo' | 'backend'>('backend')
-
-  // Data received from JSON
+  const [optimization, setOptimization] = useState<Optimization>(preferences.defaultOptimization)
+  const [selectedId, setSelectedId] = useState<string | null>(() => {
+    const stored = readStorage<unknown>(ACTIVE_KEY, null)
+    return typeof stored === 'string' && stored ? stored : null
+  })
+  const selectedRef = useRef(selectedId)
+  const pollController = useRef<AbortController | null>(null)
   const [result, setResult] = useState<BackendResult | null>(null)
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+  const submitLock = useRef(false)
+  const [refreshing, setRefreshing] = useState(Boolean(selectedId))
+  const [refreshVersion, setRefreshVersion] = useState(0)
+  const [actionError, setActionError] = useState('')
+  const [pollError, setPollError] = useState('')
+  const [retrying, setRetrying] = useState(false)
 
-  // Convert form inputs into a JSON-compatible object
-  const requestData: ProjectRequest = {
-    description: prompt.trim(),
-    optimization: optimization
+  // Only one GET loop owns the selected project. A manual refresh or selection
+  // change cancels the previous GET and its scheduled timer.
+  useEffect(() => {
+    if (!selectedId) return
+    const id = selectedId
+    const controller = new AbortController()
+    pollController.current = controller
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const current = () => !controller.signal.aborted && selectedRef.current === id
+
+    async function poll() {
+      try {
+        const data = await fetchProject(id, controller.signal)
+        if (!current()) return
+        setResult(data)
+        recordProject(data)
+        setPollError('')
+        setRetrying(false)
+        if (preferences.autoRefresh && isInProgress(data.status)) {
+          timer = setTimeout(() => void poll(), POLL_INTERVAL_MS)
+        }
+      } catch (error) {
+        if (!current()) return
+        const canRetry = preferences.autoRefresh && (!(error instanceof ApiError) || error.status === undefined || error.status >= 500 || error.status === 429 || error.status === 408)
+        setPollError(message(error))
+        setRetrying(canRetry)
+        if (canRetry) timer = setTimeout(() => void poll(), RETRY_INTERVAL_MS)
+      } finally {
+        if (current()) setRefreshing(false)
+      }
+    }
+    void poll()
+    return () => {
+      controller.abort()
+      clearTimeout(timer)
+      if (pollController.current === controller) pollController.current = null
+    }
+  }, [selectedId, refreshVersion, preferences.autoRefresh, recordProject])
+
+  function navigate(tab: Tab) {
+    setActiveTab(tab)
+    setMenuOpen(false)
   }
 
-  // While the backend is still processing, re-fetch the project every few seconds
-  useEffect(() => {
-    if (mode !== 'backend' || !result || !isInProgress(result.status)) {
-      return
-    }
+  function selectProject(id: string | null, data: BackendResult | null = null) {
+    pollController.current?.abort()
+    selectedRef.current = id
+    setSelectedId(id)
+    setResult(data)
+    setPollError('')
+    setRetrying(false)
+    setRefreshing(Boolean(id && !data))
+    setRefreshVersion(value => value + 1)
+    try {
+      if (id) window.localStorage.setItem(ACTIVE_KEY, JSON.stringify(id))
+      else window.localStorage.removeItem(ACTIVE_KEY)
+    } catch { /* The current session still works when storage is unavailable. */ }
+  }
 
-    let cancelled = false
+  const activeRun = Boolean(selectedId && (!result || isInProgress(result.status)))
+  const generationBlocked = submitting || activeRun
 
-    const timer = setTimeout(async () => {
-      try {
-        const updatedData = await loadJson(projectUrl(result.id), {
-          cache: 'no-store'
-        })
-
-        if (!cancelled) {
-          setResult(updatedData)
-        }
-      } catch (err) {
-        if (!cancelled) {
-          setError(err instanceof Error ? err.message : 'Refresh failed')
-        }
-      }
-    }, POLL_INTERVAL_MS)
-
-    return () => {
-      cancelled = true
-      clearTimeout(timer)
-    }
-  }, [mode, result])
-
-  // Runs when Generate Project is clicked
   async function handleGenerate(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
-
-    setLoading(true)
-    setError('')
-    setResult(null)
-
+    if (submitLock.current || generationBlocked) return
+    const description = prompt.trim()
+    if (!description || description.length > MAX_PROMPT_LENGTH) {
+      setActionError(`Enter a prompt between 1 and ${MAX_PROMPT_LENGTH} characters.`)
+      return
+    }
+    submitLock.current = true
+    setSubmitting(true)
+    setActionError('')
     try {
-      let data: BackendResult
-
-      if (mode === 'demo') {
-        // Read external JSON from the public folder
-        data = await loadJson('/demo-response.json', {
-          cache: 'no-store'
-        })
-      } else {
-        // Send user inputs to the real backend as JSON.
-        // The backend replies immediately with a "pending" project; polling picks up progress.
-        data = await loadJson(`${API_BASE_URL}/projects`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify(requestData)
-        })
-      }
-
-      setResult(data)
-    } catch (err) {
-      setError(
-        err instanceof Error ? err.message : 'Something went wrong'
-      )
+      // Do not retry POST automatically: a timed-out request may have created a project.
+      const data = await createProject({ description, optimization })
+      recordProject(data)
+      selectProject(data.id, data)
+    } catch (error) {
+      setActionError(message(error))
     } finally {
-      setLoading(false)
+      submitLock.current = false
+      setSubmitting(false)
     }
   }
 
-  // Reload the latest JSON data
-  async function handleRefresh() {
-    if (!result) return
-
-    setLoading(true)
-    setError('')
-
-    try {
-      const url =
-        mode === 'demo' ? '/demo-response.json' : projectUrl(result.id)
-
-      const updatedData = await loadJson(url, {
-        cache: 'no-store'
-      })
-
-      setResult(updatedData)
-    } catch (err) {
-      setError(
-        err instanceof Error ? err.message : 'Refresh failed'
-      )
-    } finally {
-      setLoading(false)
-    }
+  function handleRefresh() {
+    if (!selectedId || submitLock.current) return
+    pollController.current?.abort()
+    setRefreshing(true)
+    setActionError('')
+    setRefreshVersion(value => value + 1)
   }
 
-  // Calculate progress from received tasks
-  const completedCount =
-    result?.tasks.filter(task => task.status === 'completed').length ?? 0
+  function openProject(id: string) {
+    if (submitLock.current) return
+    if (id !== selectedId && activeRun && !window.confirm('Open a different project? The current run will continue on the backend and can be reopened from History.')) return
+    setActionError('')
+    if (id === selectedId) handleRefresh()
+    else selectProject(id)
+    navigate('home')
+  }
 
-  const finishedCount =
-    result?.tasks.filter(task => !isInProgress(task.status)).length ?? 0
+  function newProject() {
+    if (submitLock.current) return
+    // Explicitly leaving a run is allowed; its history entry remains available.
+    if (activeRun && !window.confirm('Leave this project? This does not cancel its backend execution. You can reopen it from History if its ID was saved.')) return
+    selectProject(null)
+    setPrompt('')
+    setOptimization(preferences.defaultOptimization)
+    setActionError('')
+    navigate('home')
+  }
 
-  const totalTasks = result?.tasks.length ?? 0
+  function handleRemove(id: string) {
+    if (id === selectedId) {
+      window.alert('Open a different project or choose New Project before removing this entry.')
+      return
+    }
+    removeFromHistory(id)
+  }
 
-  const progress =
-    totalTasks > 0
-      ? Math.round((finishedCount / totalTasks) * 100)
-      : 0
-
-  const polling =
-    mode === 'backend' && result !== null && isInProgress(result.status)
+  function handleClear() {
+    if (selectedId || submitLock.current) {
+      window.alert('Leave the current project before clearing browser history.')
+      return
+    }
+    clearHistory()
+  }
 
   return (
     <div className="app">
-      <div className="topbar">
-        <button
-          type="button"
-          className="menu-toggle"
-          aria-label={menuOpen ? 'Close navigation menu' : 'Open navigation menu'}
-          aria-expanded={menuOpen}
-          aria-controls="app-navigation"
-          onClick={() => setMenuOpen(open => !open)}
-        >
-          <span /><span /><span />
-        </button>
-        <span className="topbar-brand"><span className="brand-mark">G</span> GENOVATION <span className="brand-subtitle">/ AI STUDIO</span></span>
-        <span className="topbar-status"><span className="status-dot" /> Workspace</span>
-      </div>
-
-      {menuOpen && <button type="button" className="nav-backdrop" aria-label="Close menu" onClick={() => setMenuOpen(false)} />}
-      <aside id="app-navigation" className={`side-nav ${menuOpen ? 'side-nav-open' : ''}`} aria-hidden={!menuOpen}>
-        <div className="nav-caption">WORKSPACE</div>
-        {([
-          ['home', '⌂', 'Home'],
-          ['history', '◷', 'History'],
-          ['projects', '▦', 'Projects'],
-          ['settings', '⚙', 'Settings'],
-          ['help', '?', 'Help & Support'],
-        ] as const).map(([tab, symbol, title]) => (
-          <button
-            type="button"
-            key={tab}
-            className={`nav-item ${activeTab === tab ? 'nav-item-active' : ''}`}
-            tabIndex={menuOpen ? 0 : -1}
-            onClick={() => { setActiveTab(tab); setMenuOpen(false) }}
-          >
-            <span className="nav-icon" aria-hidden="true">{symbol}</span><span>{title}</span>
-            {tab !== 'home' && <span className="nav-soon">SOON</span>}
-          </button>
-        ))}
-        <div className="nav-footer">GENOVATION AI <span>·</span> Preview workspace</div>
-      </aside>
-
-      {activeTab === 'home' ? <>
-      <header className="header">
-        <h1>AI Orchestrator</h1>
-        <p>Build software using multiple AI models</p>
-      </header>
-
-      <main className="container">
-        {/* INPUT SECTION */}
-        <section className="card">
-          <div className="project-intro">
-            <h2>Create a Project</h2>
-            <p>Describe what you want the AI to build.</p>
-          </div>
-
-          <form onSubmit={handleGenerate}>
-            <label htmlFor="prompt">Your Prompt</label>
-
-            <textarea
-              id="prompt"
-              rows={5}
-              placeholder="Build a task management application..."
-              value={prompt}
-              onChange={e => setPrompt(e.target.value)}
-            />
-
-            <label htmlFor="optimization">Optimization</label>
-
-            <select
-              id="optimization"
-              value={optimization}
-              onChange={e => setOptimization(e.target.value as Optimization)}
-            >
-              <option value="balanced">Balanced</option>
-              <option value="speed">Fastest</option>
-              <option value="quality">Best Quality</option>
-            </select>
-
-            <button
-              className="generate-btn"
-              type="submit"
-              disabled={!prompt.trim() || loading}
-            >
-              {loading ? 'Loading...' : 'Generate Project'}
-            </button>
-          </form>
-
-        </section>
-
-        {/* ERROR SECTION */}
-        {error && (
-          <div className="error-message">
-            <strong>Error:</strong> {error}
-          </div>
-        )}
-
-        {/* RESULTS SECTION */}
-        {result && (
-          <section className="card results">
-            <div className="results-header">
-              <h2>Orchestration Dashboard</h2>
-
-              <button
-                className="refresh-btn"
-                type="button"
-                onClick={handleRefresh}
-                disabled={loading}
-              >
-                {loading ? 'Refreshing...' : 'Refresh'}
-              </button>
-            </div>
-
-            <p><strong>Project ID:</strong> {result.id}</p>
-            <p>
-              <strong>Overall Status:</strong> {result.status}
-              {polling && ' (updating automatically...)'}
-            </p>
-            <p><strong>Optimization:</strong> {result.optimization}</p>
-
-            {result.summary && (
-              <p><strong>Summary:</strong> {result.summary}</p>
-            )}
-
-            <h3>Task Progress</h3>
-
-            <div className="progress-bar">
-              <div
-                className="progress-fill"
-                style={{ width: `${progress}%` }}
-              />
-            </div>
-
-            <p>
-              {finishedCount} of {totalTasks} tasks finished, {completedCount} completed ({progress}%)
-            </p>
-
-            {/* Dynamically display every task from JSON */}
-            <div className="task-list">
-              {result.tasks.map(task => (
-                <div className="task" key={task.id}>
-                  <div>
-                    <strong>{task.position}. {task.name}</strong>
-
-                    {task.description && <p>{task.description}</p>}
-
-                    <p>
-                      Tool: {task.tool ?? (task.status === 'failed' ? 'none passed' : 'Unassigned')} · Attempts: {task.attempts}
-                    </p>
-
-                    {task.output && (
-                      <pre className="json-box">{task.output}</pre>
-                    )}
-                  </div>
-
-                  <span className={`status ${task.status}`}>
-                    {task.status}
-                  </span>
-                </div>
-              ))}
-            </div>
-
-            {result.tasks.length === 0 && (
-              <p>No tasks have been returned yet.</p>
-            )}
-
-            {/* Generated files from backend */}
-            <h3>Generated Files</h3>
-
-            {mode === 'backend' && result.downloadable && (
-              <a className="download-btn" href={`${projectUrl(result.id)}/download`} download>
-                Download project (.zip)
-              </a>
-            )}
-
-            {result.files && result.files.length > 0 ? (
-              <div className="output-box">
-                {result.files.map(file => (
-                  <details key={file.path}>
-                    <summary>{file.path}</summary>
-
-                    {file.description && <p>{file.description}</p>}
-
-                    {file.content && (
-                      <pre className="json-box">{file.content}</pre>
-                    )}
-                  </details>
-                ))}
-              </div>
-            ) : (
-              <p>No generated files available yet.</p>
-            )}
-
-            {/* Optional execution metrics */}
-            {result.metrics && (
-              <>
-                <h3>Execution Details</h3>
-
-                {result.metrics.duration_seconds !== undefined && (
-                  <p>
-                    <strong>Execution Time:</strong>{' '}
-                    {result.metrics.duration_seconds} seconds
-                  </p>
-                )}
-
-                {result.metrics.tokens_used !== undefined && (
-                  <p>
-                    <strong>Tokens Used:</strong>{' '}
-                    {result.metrics.tokens_used}
-                  </p>
-                )}
-              </>
-            )}
-
-          </section>
-        )}
-      </main>
-      </> : (
-        <main className="container placeholder-container">
-          <section className="card placeholder-card">
-            <div className="placeholder-icon">{activeTab === 'history' ? '◷' : activeTab === 'settings' ? '⚙' : activeTab === 'projects' ? '▦' : '?'}</div>
-            <span className="eyebrow">WORKSPACE / {activeTab.toUpperCase()}</span>
-            <h1>{activeTab === 'history' ? 'History' : activeTab === 'settings' ? 'Settings' : activeTab === 'projects' ? 'Projects' : 'Help & Support'}</h1>
-            <p>This section is a placeholder for future functionality. Your project builder is unchanged.</p>
-            <button type="button" className="generate-btn back-home" onClick={() => setActiveTab('home')}>Back to Project Builder</button>
-          </section>
-        </main>
-      )}
+      <Sidebar menuOpen={menuOpen} activeTab={activeTab} savedCount={savedProjects.length}
+        onToggle={() => setMenuOpen(open => !open)} onClose={() => setMenuOpen(false)} onNavigate={navigate} />
+      {activeTab === 'home' && <HomePage prompt={prompt} optimization={optimization}
+        loading={submitting} refreshing={refreshing} generationBlocked={generationBlocked}
+        selectedId={selectedId} error={actionError} pollError={pollError} retrying={retrying}
+        result={result} autoRefresh={preferences.autoRefresh}
+        isSaved={history.some(item => item.id === result?.id && item.saved)}
+        onPromptChange={setPrompt} onOptimizationChange={setOptimization} onGenerate={handleGenerate}
+        onRefresh={handleRefresh} onToggleSaved={toggleSaved} onNewProject={newProject} />}
+      {activeTab === 'history' && <HistoryPage history={history} onNewProject={newProject}
+        onOpen={openProject} onToggleSaved={toggleSaved} onRemove={handleRemove} onClear={handleClear} />}
+      {activeTab === 'projects' && <ProjectsPage savedProjects={savedProjects} onHistory={() => navigate('history')}
+        onNewProject={newProject} onOpen={openProject} onToggleSaved={toggleSaved} />}
+      {activeTab === 'settings' && <SettingsPage preferences={preferences} onPreferencesChange={setPreferences} />}
+      {activeTab === 'help' && <HelpPage onNewProject={() => navigate('home')} />}
     </div>
   )
 }

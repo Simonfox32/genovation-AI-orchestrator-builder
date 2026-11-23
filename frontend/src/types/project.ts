@@ -21,8 +21,8 @@ export type Task = {
 
 export type GeneratedFile = {
   path: string
-  description?: string
-  content?: string
+  description?: string | null
+  content?: string | null
 }
 
 export type BackendResult = {

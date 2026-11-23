@@ -6,18 +6,22 @@ type Props = {
   project: BackendResult
   loading: boolean
   autoRefresh: boolean
+  pollError: boolean
   isSaved: boolean
   onRefresh: () => void
   onToggleSaved: (id: string) => void
   onNewProject: () => void
 }
 
-export function ProjectResults({ project, loading, autoRefresh, isSaved, onRefresh, onToggleSaved, onNewProject }: Props) {
+export function ProjectResults({ project, loading, autoRefresh, pollError, isSaved, onRefresh, onToggleSaved, onNewProject }: Props) {
   const completedCount = project.tasks.filter(task => task.status === 'completed').length
-  const finishedCount = project.tasks.filter(task => !isInProgress(task.status)).length
+  const failedCount = project.tasks.filter(task => task.status === 'failed').length
+  const finishedCount = completedCount + failedCount
   const totalTasks = project.tasks.length
   const progress = totalTasks ? Math.round(finishedCount / totalTasks * 100) : 0
-  const polling = autoRefresh && isInProgress(project.status)
+  const failedProgress = totalTasks ? (failedCount / totalTasks) * 100 : 0
+  const successProgress = totalTasks ? (completedCount / totalTasks) * 100 : 0
+  const polling = autoRefresh && !pollError && isInProgress(project.status)
 
   return (
     <section className="card results">
@@ -33,9 +37,13 @@ export function ProjectResults({ project, loading, autoRefresh, isSaved, onRefre
       <p><strong>Optimization:</strong> {project.optimization}</p>
       {project.summary && <p><strong>Summary:</strong> {project.summary}</p>}
 
-      <h3>Task Progress</h3>
-      <div className="progress-bar"><div className="progress-fill" style={{ width: `${progress}%` }} /></div>
-      <p>{finishedCount} of {totalTasks} tasks finished, {completedCount} completed ({progress}%)</p>
+      <h3>Observed Task Results</h3>
+      <div className="progress-bar" role="img" aria-label={`${completedCount} completed, ${failedCount} failed, ${totalTasks - finishedCount} unfinished`}>
+        <div className="progress-fill" style={{ width: `${successProgress}%` }} />
+        <div className="progress-failed" style={{ width: `${failedProgress}%` }} />
+      </div>
+      <p>{finishedCount} of {totalTasks} known tasks finished ({progress}%). {completedCount} completed · {failedCount} failed · {totalTasks - finishedCount} unfinished.</p>
+      {isInProgress(project.status) && <p className="workspace-note">The orchestrator may discover more tasks. This is not a project completion percentage.</p>}
 
       <div className="task-list">
         {project.tasks.map(task => (
@@ -56,7 +64,7 @@ export function ProjectResults({ project, loading, autoRefresh, isSaved, onRefre
         <button type="button" className="workspace-secondary workspace-save-btn" onClick={() => onToggleSaved(project.id)}>
           {isSaved ? '★ Saved to Projects' : '☆ Save to Projects'}
         </button>
-        <button type="button" className="workspace-secondary workspace-save-btn" onClick={onNewProject}>+ New Project</button>
+        <button type="button" className="workspace-secondary workspace-save-btn" disabled={loading} onClick={onNewProject}>+ New Project</button>
       </div>
 
       <h3>Generated Files</h3>
@@ -71,7 +79,7 @@ export function ProjectResults({ project, loading, autoRefresh, isSaved, onRefre
             <details key={file.path}>
               <summary>{file.path}</summary>
               {file.description && <p>{file.description}</p>}
-              {file.content && <pre className="json-box">{file.content}</pre>}
+              {file.content != null && <pre className="json-box">{file.content}</pre>}
             </details>
           ))}
         </div>
