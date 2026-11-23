@@ -18,13 +18,14 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from google import genai
-from google.genai import types
-
 try:  # Anula's model tiers from the v1 router, reused so both pipelines agree on what "cheap/strong" means
+    from . import model_client
+    from .model_client import ToolSpec
     from .router import CHEAP_MODEL, MEDIUM_MODEL, STRONG_MODEL
     from .executors import DockerExecutor, LocalExecutor, SandboxExecutor
 except ImportError:  # run as a script: python orchestrator/agent.py
+    import model_client
+    from model_client import ToolSpec
     from router import CHEAP_MODEL, MEDIUM_MODEL, STRONG_MODEL
     from executors import DockerExecutor, LocalExecutor, SandboxExecutor
 
@@ -224,56 +225,56 @@ def retry_message(failing, verdict, tests_changed, decided=True):
 
 # ---- The tool menu: what the model reads to decide which tool to ask for ----
 
-list_files_tool = types.FunctionDeclaration(
+list_files_tool = ToolSpec(
     name="list_files",
     description="List every file in the project (recursively), or inside one folder.",
-    parameters_json_schema={"type": "object", "properties": {
+    parameters={"type": "object", "properties": {
         "folder": {"type": "string", "description": "Folder relative to the project root. '.' for everything."}}},
 )
-read_file_tool = types.FunctionDeclaration(
+read_file_tool = ToolSpec(
     name="read_file",
     description="Read a file's full contents.",
-    parameters_json_schema={"type": "object", "properties": {
+    parameters={"type": "object", "properties": {
         "path": {"type": "string", "description": "File path relative to the project root, e.g. 'app/main.py'."}},
         "required": ["path"]},
 )
-write_file_tool = types.FunctionDeclaration(
+write_file_tool = ToolSpec(
     name="write_file",
     description="Create or overwrite a file with the complete new contents.",
-    parameters_json_schema={"type": "object", "properties": {
+    parameters={"type": "object", "properties": {
         "path": {"type": "string", "description": "File path relative to the project root."},
         "content": {"type": "string", "description": "The full file contents."}},
         "required": ["path", "content"]},
 )
-run_tests_tool = types.FunctionDeclaration(
+run_tests_tool = ToolSpec(
     name="run_tests",
     description="Run the test suite with pytest and return its output: failures and the summary.",
-    parameters_json_schema={"type": "object", "properties": {}},
+    parameters={"type": "object", "properties": {}},
 )
-report_test_problem_tool = types.FunctionDeclaration(
+report_test_problem_tool = ToolSpec(
     name="report_test_problem",
     description=("Report a test that can't pass without breaking a numbered requirement or another test, or whose "
                  "expected value is wrong. This ends your turn: a tester checks the test, then you continue."),
-    parameters_json_schema={"type": "object", "properties": {
+    parameters={"type": "object", "properties": {
         "test": {"type": "string", "description": "The failing test's function name, e.g. 'test_r10_dispatch'."},
         "reason": {"type": "string", "description": "The contradiction, citing requirement numbers."}},
         "required": ["test", "reason"]},
 )
-fix_test_tool = types.FunctionDeclaration(
+fix_test_tool = ToolSpec(
     name="fix_test",
     description=("The test under review is wrong: replace it with a corrected version. Every other test stays exactly "
                  "as it is."),
-    parameters_json_schema={"type": "object", "properties": {
+    parameters={"type": "object", "properties": {
         "test": {"type": "string", "description": "The test function's name, e.g. 'test_r10_dispatch'."},
         "new_code": {"type": "string", "description": "The complete corrected function, with the same name."},
         "reason": {"type": "string", "description": "What was wrong, citing requirement numbers."}},
         "required": ["test", "new_code", "reason"]},
 )
-uphold_test_tool = types.FunctionDeclaration(
+uphold_test_tool = ToolSpec(
     name="uphold_test",
     description=("Use only when the failing test's expected result AGREES with the requirements, so the code must "
                  "change. Leaves the test as it is. If they disagree, call fix_test instead."),
-    parameters_json_schema={"type": "object", "properties": {
+    parameters={"type": "object", "properties": {
         "test": {"type": "string", "description": "The test function's name, e.g. 'test_r10_dispatch'."},
         "test_expects": {"type": "string", "description": "The exact result the failing assert expects."},
         "requirement_says": {"type": "string", "description": "What the numbered requirement says should happen here."},
@@ -535,10 +536,6 @@ def run_agent(workspace, on_step=None, model=MODEL, max_steps=15, system_prompt=
     reviewable = reviewable and not is_tester
     watch = ProgressWatch() if reviewable else None
 
-    # Created here, not at import time, so importing this file never needs a key. The timeout matters: without it,
-    # a model that never answers (seen with the strong model under load) hangs the run forever and no fallback starts.
-    client = genai.Client(http_options=types.HttpOptions(timeout=REQUEST_TIMEOUT_MS))
-
     executor = executor or LocalExecutor(workspace)  # where the work happens; local unless told otherwise
     tools = make_tools(executor, role=role)
     menu = REVIEWABLE_TOOL_MENU if reviewable else TOOL_MENU
@@ -547,16 +544,14 @@ def run_agent(workspace, on_step=None, model=MODEL, max_steps=15, system_prompt=
         tools.update(fix_test=review.fix_test, uphold_test=review.uphold_test)
         menu = REVIEW_TOOL_MENU
 
-    config = types.GenerateContentConfig(
-        system_instruction=system_prompt,
-        tools=[types.Tool(function_declarations=menu)],
-        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-    )
+    # Created here, not at import time, so importing this file never needs a key. The timeout matters: without it,
+    # a model that never answers (seen with the strong model under load) hangs the run forever and no fallback starts.
+    conversation = model_client.start_conversation(system_prompt, menu, start_message, timeout_ms=REQUEST_TIMEOUT_MS)
 
     current = {"model": model}  # a dict so ask_model can change it (switch to the fallback model)
 
-    def ask_model(history):
-        """Call Gemini, retrying when it fails. Two kinds of failure, handled differently:
+    def ask_model():
+        """Call the model, retrying when it fails. Two kinds of failure, handled differently:
         - 429 RESOURCE_EXHAUSTED: the free tier's per-minute request limit. Waiting fixes it, so wait longer
           (10s, 20s, 30s... about 2.5 minutes in total) before giving up.
         - Anything else (503 overloaded, timeouts): short waits. And after 1 failure on a model other than the
@@ -564,7 +559,7 @@ def run_agent(workspace, on_step=None, model=MODEL, max_steps=15, system_prompt=
           failing, and a demo cannot wait minutes)."""
         for attempt in range(1, MAX_ATTEMPTS + 1):
             try:
-                return client.models.generate_content(model=current["model"], contents=history, config=config)
+                return conversation.send(current["model"])
             except Exception as error:
                 rate_limited = "429" in str(error) or "RESOURCE_EXHAUSTED" in str(error)
                 wait = attempt * (10 if rate_limited else 3)
@@ -575,8 +570,6 @@ def run_agent(workspace, on_step=None, model=MODEL, max_steps=15, system_prompt=
                 if attempt < MAX_ATTEMPTS:
                     time.sleep(wait)
         raise RuntimeError(f"Gemini unavailable after {MAX_ATTEMPTS} attempts")
-
-    history = [types.Content(role="user", parts=[types.Part(text=start_message)])]
 
     def stopped(step, output, summary, **extra):
         return {"passed": False, "steps": step, "summary": summary, "test_output": output,
@@ -592,10 +585,9 @@ def run_agent(workspace, on_step=None, model=MODEL, max_steps=15, system_prompt=
     warning_nags = 0
 
     for step in range(1, max_steps + 1):
-        response = ask_model(history)
-        history.append(response.candidates[0].content)
+        reply = conversation.record(ask_model())
 
-        calls = response.function_calls
+        calls = reply.calls
         if not calls:
             # The model says it's finished. Don't take its word for it: check ourselves.
             done, output, feedback = done_check(tools)
@@ -604,16 +596,16 @@ def run_agent(workspace, on_step=None, model=MODEL, max_steps=15, system_prompt=
                     done = True
                 warning_nags += 1
             if done:
-                return {"passed": True, "steps": step, "summary": response.text or "", "test_output": output,
+                return {"passed": True, "steps": step, "summary": reply.text, "test_output": output,
                         "model": current["model"]}
             if watch and watch.record(output):
                 return stuck(step, output)
-            history.append(types.Content(role="user", parts=[types.Part(text=feedback)]))
+            conversation.add_text(feedback)
             continue
 
         results = []
         for call in calls:
-            args = dict(call.args or {})
+            args = call.args
             try:
                 result = str(tools[call.name](**args))
             except Exception as error:
@@ -626,16 +618,15 @@ def run_agent(workspace, on_step=None, model=MODEL, max_steps=15, system_prompt=
                                disputed={"test": test, "reason": str(args.get("reason", ""))})
             if watch and call.name == "run_tests" and watch.record(result):
                 return stuck(step, result)
-            results.append(types.Part(function_response=types.FunctionResponse(
-                id=call.id, name=call.name, response={"result": result})))
-        history.append(types.Content(role="user", parts=results))
+            results.append((call, result))
+        conversation.add_tool_results(results)
 
         if review and review.complete:  # every test under review has a decision: the review is over
             done, output, feedback = done_check(tools)
             if done:
                 return {"passed": True, "steps": step, "summary": review.verdict, "test_output": output,
                         "model": current["model"]}
-            history.append(types.Content(role="user", parts=[types.Part(text=feedback)]))
+            conversation.add_text(feedback)
 
     # Out of steps. Check once more: the work may be done even though the agent never said so.
     done, output, _ = done_check(tools)

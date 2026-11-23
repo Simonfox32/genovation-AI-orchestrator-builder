@@ -213,7 +213,7 @@ def test_overloaded_model_falls_back_to_the_medium_model(workspace, monkeypatch)
             content = types.Content(role="model", parts=[types.Part(text="All done.")])
             return SimpleNamespace(candidates=[SimpleNamespace(content=content)], function_calls=None, text="All done.")
 
-    monkeypatch.setattr(agent.genai, "Client", lambda **settings: SimpleNamespace(models=FakeModels()))
+    monkeypatch.setattr(agent.model_client.genai, "Client", lambda **settings: SimpleNamespace(models=FakeModels()))
     monkeypatch.setattr(agent.time, "sleep", lambda seconds: None)
 
     outcome = agent.run_agent(workspace, model=agent.STRONG_MODEL, max_steps=1)
@@ -247,7 +247,7 @@ def test_rate_limit_waits_longer_and_keeps_the_model(workspace, monkeypatch):
             content = types.Content(role="model", parts=[types.Part(text="All done.")])
             return SimpleNamespace(candidates=[SimpleNamespace(content=content)], function_calls=None, text="All done.")
 
-    monkeypatch.setattr(agent.genai, "Client", lambda **settings: SimpleNamespace(models=FakeModels()))
+    monkeypatch.setattr(agent.model_client.genai, "Client", lambda **settings: SimpleNamespace(models=FakeModels()))
     monkeypatch.setattr(agent.time, "sleep", waits.append)
 
     agent.run_agent(workspace, model=agent.MEDIUM_MODEL, max_steps=1)
@@ -333,7 +333,7 @@ def fake_gemini(monkeypatch, calls_for_turn):
             return SimpleNamespace(candidates=[SimpleNamespace(content=types.Content(role="model", parts=parts))],
                                    function_calls=asked, text=None)
 
-    monkeypatch.setattr(agent.genai, "Client", lambda **settings: SimpleNamespace(models=FakeModels()))
+    monkeypatch.setattr(agent.model_client.genai, "Client", lambda **settings: SimpleNamespace(models=FakeModels()))
     return configs
 
 
