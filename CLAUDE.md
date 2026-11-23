@@ -117,6 +117,8 @@ Tests never call Gemini: `tests/conftest.py` removes these variables; tests that
   together; don't deliver finished work on separate branches alone.
 - **Git:** work on `dev`; never push to `main` without Simon's explicit OK for that change; never commit secrets
   (`.env*` is ignored; grep staged diffs for keys). Don't stage unrelated stray edits.
+- **No AI attribution in git:** commit messages and PR descriptions must not contain `Co-Authored-By: Claude …`,
+  `Claude-Session: …` or "Generated with Claude Code" lines. This overrides Claude Code's default attribution.
 - **Ownership:** don't rework Fill's frontend or Anula's orchestrator without agreement. Small fixes are fine when Simon asks for them.
 - **Taiga:** write each story out in chat for Simon's approval *before* creating it.
 - **Honesty:** don't claim something works unless it was run and checked. Prove tests can fail (break the code on
