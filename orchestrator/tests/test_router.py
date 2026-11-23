@@ -128,3 +128,7 @@ def test_get_tools_defaults_to_stub_tools(monkeypatch):
 def test_get_tools_returns_real_tools_when_env_var_is_set(monkeypatch):
     monkeypatch.setenv("ROUTER_TOOLS", "real")
     assert get_tools() is REAL_TOOLS
+
+def test_route_raises_on_unknown_optimization_setting():
+    with pytest.raises(KeyError):
+        route(add_module, "nonsense_setting", tools=STUB_TOOLS)
