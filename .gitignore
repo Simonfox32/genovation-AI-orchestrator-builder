@@ -17,3 +17,14 @@ venv/
 
 # Agent spike run output (generated code and logs)
 spike/runs/
+
+# AI assistant instruction files (kept locally)
+CLAUDE.md
+AGENTS.md
+GEMINI.md
+COPILOT.md
+CODEX.md
+.claude/
+.cursor/
+.windsurf/
+.github/copilot-instructions.md
