@@ -41,6 +41,8 @@ REVIEW_ROUNDS = 2   # times the tester re-checks the failing tests and the build
 WARNING_NAGS = 2    # times a builder whose tests all pass is sent back to fix warnings; after that, accept the work
 REVIEW_STEPS = 10   # steps for one tester review (a real one, replaying 11-18's run, used 8: read, read, fix, test, fix)
 RETRY_STEPS = 15    # steps for each extra builder round (a fresh history, so it starts fast again)
+TEST_OUTPUT_LIMIT = 4000  # characters of one test run the model reads. Our own checks always read all of it.
+FAILURES_LISTED = 20      # failing tests named in a shortened run; the full count is always given
 
 # The dashboard's Optimization setting -> which Gemini model the agents use.
 MODELS_BY_OPTIMIZATION = {"speed": CHEAP_MODEL, "balanced": MEDIUM_MODEL, "quality": STRONG_MODEL}
@@ -58,6 +60,9 @@ TEMPLATE_DB = Path(__file__).parent / "agent_template_db"  # FastAPI + SQLite/SQ
 # breaks every test (see the C1c experiment: foreign keys off, or no StaticPool).
 # requirements.txt lists what the sandbox can actually run: the sandbox has no network to install anything else.
 PROTECTED = {"app/db.py", "tests/conftest.py", "requirements.txt"}
+# Any of these can change how pytest runs or what counts as a pass (Nov 23 audit: a root conftest.py turned a failing
+# test into a pass), so no agent may write one. The template's own tests/conftest.py is in PROTECTED above.
+PYTEST_CONFIG_FILES = {"conftest.py", "pytest.ini", ".pytest.ini", "pyproject.toml", "tox.ini", "setup.cfg"}
 
 SYSTEM_PROMPT = """You are the backend developer on a small team, working on a Python FastAPI project.
 Your job: make every test in tests/ pass.
@@ -319,6 +324,8 @@ def make_tools(executor, role="builder"):
             return "REFUSED: use a path relative to the project, like app/main.py."
         if os.path.normpath(path) in PROTECTED:
             return f"REFUSED: {path} is part of the project's setup. Read it, but don't change it."
+        if Path(os.path.normpath(path)).name in PYTEST_CONFIG_FILES:
+            return f"REFUSED: {path} would change how the tests run, so it can't be written."
         in_tests = in_folder(path, "tests")
         if role == "builder" and in_tests:
             return "REFUSED: tests/ holds the requirements. Change the app code instead."
@@ -334,11 +341,12 @@ def make_tools(executor, role="builder"):
     def pytest(*extra):
         # -B: never cache bytecode. Vercel Sandbox gives every written file mtime 0, and Python reuses a .pyc whose source
         # has the same mtime and size, so a same-size edit (1 -> 2) would silently keep running the old code.
-        exit_code, output = executor.run([executor.python, "-B", "-m", "pytest", "-q", "-p", "no:cacheprovider", *extra],
-                                         timeout=60)
+        # "tests": only the tests/ folder counts, so a test file hidden in app/ can't add easy passes.
+        exit_code, output = executor.run([executor.python, "-B", "-m", "pytest", "-q", "-p", "no:cacheprovider", "tests",
+                                          *extra], timeout=60)
         if exit_code is None:  # the executor stopped it: it ran too long
             return "TIMEOUT: the tests took longer than 60 seconds."
-        return output[-4000:]  # the end has the failures and the summary; keeps what we send small
+        return PytestRun(exit_code, output)
 
     def run_tests():
         return pytest()
@@ -374,16 +382,66 @@ def seed_workspace(executor, include_tests=True, template=TEMPLATE):
             continue  # skip the built-in tests only: tests/conftest.py is setup, and is always needed
         executor.write_file(relative, source.read_text())
 
+FAILED_TEST = re.compile(r"^(?:FAILED|ERROR) \S+::(\w+)", re.MULTILINE)
+SUMMARY_LINE = re.compile(r"^=*\s*\d+ (?:passed|failed|errors?|skipped|xfailed|xpassed|deselected|warnings?)\b.* in \d.*$",
+                          re.MULTILINE)
+NOT_A_PASS = ("failed", "error", "skipped", "xpassed", "deselected")  # "failed" also covers xfailed
+
+
+def shorten_test_output(output, limit=None):
+    """What the model reads from a long test run: the first failures in detail, which tests failed, and the summary.
+    (Keeping only the end used to hide most failures, and left no detail about any of them.)"""
+    limit = limit or TEST_OUTPUT_LIMIT
+    if len(output) <= limit:
+        return output
+    lines = output.rstrip().splitlines()
+    failing = [line[:140] for line in lines if line.startswith(("FAILED ", "ERROR "))]
+    listed = failing[:FAILURES_LISTED]
+    if len(failing) > len(listed):
+        listed.append(f"... and {len(failing) - len(listed)} more failing tests")
+    tail = "\n".join([*listed, lines[-1][:300]])
+    head = output[:max(0, limit - len(tail) - 40)]
+    return f"{head}\n... (output shortened) ...\n{tail}"
+
+
+class PytestRun(str):
+    """One test run. As text it's the short version the model reads; its attributes are facts from the COMPLETE output,
+    so our own decisions never depend on what was cut. Being a str keeps every place that prints it working."""
+
+    def __new__(cls, exit_code, output):
+        run = super().__new__(cls, shorten_test_output(output))
+        run.exit_code = exit_code
+        run.failing = frozenset(FAILED_TEST.findall(output))
+        run.summaries = SUMMARY_LINE.findall(output)
+        return run
+
+
+def clean_summary(line):
+    return "passed" in line and not any(word in line for word in NOT_A_PASS)
+
+
 def tests_pass(output):
-    """pytest's last line is the summary, e.g. '10 passed in 0.3s' or '2 failed, 8 passed in 0.4s'."""
+    """Did every test really pass? For a real run: pytest's exit code is 0 and no summary line reports a problem. A
+    program can print a fake '5 passed' line, but it can't remove the real one or change the exit code that way."""
+    if isinstance(output, PytestRun):
+        return output.exit_code == 0 and bool(output.summaries) and all(map(clean_summary, output.summaries))
     summary = output.strip().splitlines()[-1] if output.strip() else ""
-    return "passed" in summary and "failed" not in summary and "error" not in summary
+    return clean_summary(summary)
+
+
+def passed_count(run):
+    """How many tests passed. With several summary lines (one may be fake), trust the lowest number."""
+    lines = run.summaries if isinstance(run, PytestRun) else run.strip().splitlines()[-1:]
+    counts = [int(match.group(1)) for line in lines if (match := re.search(r"(\d+) passed", line))]
+    return min(counts, default=0)
 
 
 def failing_tests(output):
     """The names of the failing tests in pytest's output: 'FAILED tests/test_app.py::test_r3_x - assert ...' ->
     {'test_r3_x'}. A file that doesn't even load ('ERROR tests/test_app.py') names no test, so it isn't counted."""
-    return set(re.findall(r"^(?:FAILED|ERROR) \S+::(\w+)", output, re.MULTILINE))
+    if isinstance(output, PytestRun):
+        return set(output.failing)
+    return set(FAILED_TEST.findall(output))
 
 
 class ProgressWatch:
@@ -462,6 +520,25 @@ def collected_count(collected):
     return None if "error" in summary or not match else int(match.group(1))
 
 
+SKIP_MARKS = {"skip", "skipif", "xfail", "importorskip"}
+
+
+def skips_tests(tree):
+    """Does this code skip a test or expect it to fail? (pytest.mark.skip, pytest.xfail(...), from pytest import skip).
+    A plain variable called `skip`, like a pagination offset, is fine."""
+    names = {"pytest"} | {alias.asname for node in ast.walk(tree) if isinstance(node, ast.Import)
+                          for alias in node.names if alias.name == "pytest" and alias.asname}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[0] == "pytest" and any(
+                alias.name in SKIP_MARKS for alias in node.names):
+            return True
+        if isinstance(node, ast.Attribute) and node.attr in SKIP_MARKS:
+            base = node.value
+            if (isinstance(base, ast.Name) and base.id in names) or (isinstance(base, ast.Attribute) and base.attr == "mark"):
+                return True
+    return False
+
+
 def tests_are_sound(tools, min_tests=3):
     """The shape every tester's work must keep: the tests load cleanly (at least `min_tests` of them);
     tests/REQUIREMENTS.md lists the requirements; every one has a test named after it; no test covers more than 2.
@@ -488,6 +565,8 @@ def tests_are_sound(tools, min_tests=3):
     if crowded:
         return False, collected, (f"Not done: split {', '.join(crowded)} into separate tests. A test may cover at "
                                   "most 2 requirements, so one failing check never hides another.")
+    if skips_tests(ast.parse(tests)):
+        return False, collected, "Not done: remove every skip and xfail. Each test must really run and really check."
     return True, collected, ""
 
 
@@ -513,8 +592,10 @@ def review_done(tools, min_tests):
 # ---- The agent loop ----
 
 def run_agent(workspace, on_step=None, model=MODEL, max_steps=15, system_prompt=None,
-              role="builder", start_message=None, executor=None, reviewable=False, done_check=None, review=None):
+              role="builder", start_message=None, executor=None, reviewable=False, done_check=None, review=None,
+              meter=None):
     """Run one agent (role "builder" or "tester") in `workspace` until its done-check passes or `max_steps` runs out.
+    meter=UsageMeter: records the tokens and cost of every model reply.
 
     on_step(event) is called after every tool call with
         {"step": int, "tool": str, "args": dict, "result": str}
@@ -564,6 +645,8 @@ def run_agent(workspace, on_step=None, model=MODEL, max_steps=15, system_prompt=
             except Exception as error:
                 rate_limited = "429" in str(error) or "RESOURCE_EXHAUSTED" in str(error)
                 wait = attempt * (10 if rate_limited else 3)
+                if meter:
+                    meter.failed()
                 print(f"   (Model error on {current['model']}, retrying in {wait}s: {str(error)[:60]})")
                 # The history is in one provider's format, so a fallback only works within the same provider.
                 if (not rate_limited and current["model"] != FALLBACK_MODEL
@@ -589,6 +672,8 @@ def run_agent(workspace, on_step=None, model=MODEL, max_steps=15, system_prompt=
 
     for step in range(1, max_steps + 1):
         reply = conversation.record(ask_model())
+        if meter:
+            meter.add(current["model"], reply.usage, "review" if review else role)
 
         calls = reply.calls
         if not calls:
@@ -612,17 +697,18 @@ def run_agent(workspace, on_step=None, model=MODEL, max_steps=15, system_prompt=
             try:
                 if call.error:  # the model's arguments were unreadable: tell it, and don't run the tool
                     raise ValueError(call.error)
-                result = str(tools[call.name](**args))
+                answer = tools[call.name](**args)  # a test run keeps its full facts; the model gets the short text
             except Exception as error:
-                result = f"ERROR: {type(error).__name__}: {error}"
+                answer = f"ERROR: {type(error).__name__}: {error}"
+            result = str(answer)
             if on_step:
                 on_step({"step": step, "tool": call.name, "args": args, "result": result})
             if call.name == "report_test_problem" and result.startswith("REPORTED"):
                 test = result.removeprefix("REPORTED: ")
                 return stopped(step, tools["run_tests"](), f"Reported {test} as contradicting the requirements",
                                disputed={"test": test, "reason": str(args.get("reason", ""))})
-            if watch and call.name == "run_tests" and watch.record(result):
-                return stuck(step, result)
+            if watch and call.name == "run_tests" and watch.record(answer):
+                return stuck(step, answer)
             results.append((call, result))
         conversation.add_tool_results(results)
 
@@ -652,11 +738,90 @@ def snapshot_tests(executor):
 TESTS_FILE = "tests/test_app.py"
 
 
+def save_tests(executor):
+    """Our own copy of every file in tests/, {path: text}, taken before any app code exists. The final check runs
+    against this copy, whatever the generated code did to the files in the workspace."""
+    return {path: executor.read_file(path) for path in executor.list_files("tests")
+            if "__pycache__" not in path and not path.endswith(DATABASE_FILES)}
+
+
+def restore_tests(executor, saved_tests):
+    for path, content in saved_tests.items():
+        executor.write_file(path, content)
+
+
+def count_test_functions(saved_tests):
+    """How many test functions our saved copy holds, counted from the source so no running code can change the answer."""
+    count = 0
+    for path, source in saved_tests.items():
+        if Path(path).name.startswith("test_") and path.endswith(".py"):
+            count += sum(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_")
+                         for node in ast.walk(ast.parse(source)))
+    return count
+
+
+def verify_outcome(executor, saved_tests, outcome):
+    """The orchestrator's own verdict on work an agent says is finished.
+
+    Removes anything that could change how pytest runs, puts our copy of the tests back, runs them, and requires a
+    clean exit, every saved test passing, and the test files unchanged afterward. A run that already failed stays
+    failed. This raises the bar a lot, but generated code still runs in the same process as pytest.
+    """
+    if not outcome["passed"]:
+        return outcome
+    stray = [path for path in executor.list_files() if path not in saved_tests
+             and (Path(path).name in PYTEST_CONFIG_FILES or in_folder(path, "tests"))]
+    if stray:
+        executor.run(["rm", "-f", "--", *stray], timeout=30)
+    restore_tests(executor, saved_tests)
+    run = make_tools(executor, "builder")["run_tests"]()
+
+    def unchanged(path, content):
+        try:
+            return executor.read_file(path) == content
+        except FileNotFoundError:
+            return False
+
+    changed = [path for path, content in saved_tests.items() if not unchanged(path, content)]
+    if changed:
+        restore_tests(executor, saved_tests)  # the download must contain the real tests
+    expected = count_test_functions(saved_tests)
+    if changed:
+        problem = f"the run changed {', '.join(changed)}"
+    elif not tests_pass(run):
+        problem = "the tests did not all pass"
+    elif passed_count(run) < expected:
+        problem = f"only {passed_count(run)} of {expected} tests passed"
+    else:
+        return {**outcome, "test_output": run}
+    message = f"Final check failed: {problem}"
+    return {**outcome, "passed": False, "summary": message, "test_output": f"{run}\n{message}"}
+
+
+def meaningless_check(test):
+    """An assert that can never fail: only constants, x == x, or anything `or True`."""
+    if not any(isinstance(node, ast.Name) for node in ast.walk(test)):
+        return True
+    if isinstance(test, ast.Compare) and len(test.ops) == 1 and isinstance(test.ops[0], (ast.Eq, ast.Is, ast.LtE, ast.GtE)):
+        return ast.dump(test.left) == ast.dump(test.comparators[0])
+    if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.Or):
+        return any(meaningless_check(value) for value in test.values)
+    return False
+
+
+def exact_checks(checks):
+    """How many asserts pin one exact value with == or `is`."""
+    return sum(isinstance(check.test, ast.Compare) and len(check.test.ops) == 1
+               and isinstance(check.test.ops[0], (ast.Eq, ast.Is)) and not meaningless_check(check.test)
+               for check in checks)
+
+
 def replace_test(source, name, new_code):
     """`source` with the test function `name` replaced by `new_code`. Returns (new_source, problem); one is None.
 
-    Requiring the tester to act makes it tempting to "fix" a test by gutting it, so a fix must keep the test's name and
-    its number of checks, and can't assert a constant (`assert True` checks nothing).
+    Requiring the tester to act makes it tempting to "fix" a test by gutting it. So a fix must keep the test's name, its
+    number of checks and its exact checks (`== 409` can become `== 404`, but not `< 600`), can't assert something that
+    can never fail, and can't skip the test. This stops the common ways to weaken a test, not every possible one.
     """
     new_code = textwrap.dedent(new_code).strip()
     try:
@@ -675,12 +840,17 @@ def replace_test(source, name, new_code):
     new_checks = [node for node in ast.walk(new) if isinstance(node, ast.Assert)]
     if len(new_checks) < len(old_checks):
         return None, f"keep every check: the test had {len(old_checks)} assert(s), and this has {len(new_checks)}."
-    if any(isinstance(check.test, ast.Constant) for check in new_checks):
-        return None, "an assert on a constant checks nothing."
+    if any(meaningless_check(check.test) for check in new_checks):
+        return None, "an assert that can never fail checks nothing."
+    if exact_checks(new_checks) < exact_checks(old_checks):
+        return None, "keep every exact check: correct the expected value with ==, don't loosen it."
     first = old.decorator_list[0].lineno if old.decorator_list else old.lineno
     lines = source.splitlines()
     lines[first - 1:old.end_lineno] = new_code.splitlines()
-    return "\n".join(lines) + "\n", None
+    fixed = "\n".join(lines) + "\n"
+    if skips_tests(ast.parse(fixed)):
+        return None, "a test can't be skipped or marked as expected to fail."
+    return fixed, None
 
 
 class ReviewDecisions:
@@ -691,8 +861,9 @@ class ReviewDecisions:
     tests were right. So a decision is a tool call our code can check, never a sentence.
     """
 
-    def __init__(self, executor, tests, min_tests, on_write=None):
+    def __init__(self, executor, tests, min_tests, on_write=None, source=None):
         self.executor, self.tests, self.min_tests, self.on_write = executor, list(tests), min_tests, on_write
+        self.source = source  # our saved test file; fixes build on this, never on a file generated code could change
         self.rules = make_tools(executor, "tester")  # the tester's write rules and code guard still apply
         self.decided = {}  # test name -> (was it fixed?, reason)
 
@@ -726,7 +897,7 @@ class ReviewDecisions:
         refusal = self._refusal(test)
         if refusal:
             return refusal
-        before = self.executor.read_file(TESTS_FILE)
+        before = self.source if self.source is not None else self.executor.read_file(TESTS_FILE)
         fixed, problem = replace_test(before, test, str(new_code))
         if problem:
             return f"REFUSED: {problem}"
@@ -737,6 +908,7 @@ class ReviewDecisions:
         if not sound:
             self.executor.write_file(TESTS_FILE, before)
             return f"REFUSED: that change was undone because it breaks the tests. {feedback}"
+        self.source = fixed
         if self.on_write:  # logged like a write, so the dashboard's files show what's really there
             self.on_write({"step": 0, "tool": "write_file", "args": {"path": TESTS_FILE, "content": fixed},
                            "result": f"Wrote {TESTS_FILE}"})
@@ -768,7 +940,8 @@ class ReviewDecisions:
         return review_done(tools, self.min_tests)
 
 
-def review_rounds(workspace, executor, outcome, model=MODEL, step_logger=None, on_note=None, rounds=REVIEW_ROUNDS):
+def review_rounds(workspace, executor, outcome, model=MODEL, step_logger=None, on_note=None, rounds=REVIEW_ROUNDS,
+                  saved_tests=None, meter=None):
     """Team mode, after the builder's run. While it hasn't passed (it got stuck, reported a test, or ran out of
     steps) and rounds remain:
       1. the tester re-checks the failing tests against its own requirements: it fixes a wrong test, or leaves a
@@ -796,16 +969,21 @@ def review_rounds(workspace, executor, outcome, model=MODEL, step_logger=None, o
                "the developer stopped making progress" if outcome.get("stuck") else "the developer ran out of steps")
         note(f"Review {round_number}: {why}, so the tester re-checks {', '.join(failing)}", outcome["test_output"])
 
+        if saved_tests is not None:  # the review must see the real tests, whatever the app's code did to the files
+            restore_tests(executor, saved_tests)
         before = snapshot_tests(executor)
         min_tests = collected_count(make_tools(executor, "tester")["collect_tests"]()) or 3  # a review may not delete tests
         label = f"Tester (review {round_number}) · "
-        decisions = ReviewDecisions(executor, failing, min_tests, on_write=logger(label, "tester"))
+        source = saved_tests.get(TESTS_FILE) if saved_tests is not None else None
+        decisions = ReviewDecisions(executor, failing, min_tests, on_write=logger(label, "tester"), source=source)
         review = run_agent(workspace, on_step=logger(label, "tester"), model=model,
                            max_steps=REVIEW_STEPS, system_prompt=REVIEWER_PROMPT, role="tester", executor=executor,
                            start_message=review_message(failing, outcome["test_output"], dispute),
-                           done_check=decisions.done, review=decisions)
+                           done_check=decisions.done, review=decisions, meter=meter)
         if review["passed"] and decisions.complete:
             fixed, upheld, verdict = decisions.fixed, decisions.upheld, decisions.verdict
+            if saved_tests is not None and decisions.source is not None:
+                saved_tests[TESTS_FILE] = decisions.source  # an accepted correction becomes part of the real tests
         else:  # it didn't decide every test, or left them broken: put them back exactly as they were
             undo = logger(f"Tester (review {round_number}, undone) · ", "tester")
             for path in snapshot_tests(executor):
@@ -829,7 +1007,7 @@ def review_rounds(workspace, executor, outcome, model=MODEL, step_logger=None, o
         outcome = run_agent(workspace, on_step=logger(f"Builder (round {round_number + 1}) · ", "builder"),
                             model=model, max_steps=RETRY_STEPS, system_prompt=BUILDER_DB_PROMPT, executor=executor,
                             start_message=retry_message(failing, verdict, changed, bool(fixed or upheld)),
-                            reviewable=True)
+                            reviewable=True, meter=meter)
         steps += outcome["steps"]
 
     return {**outcome, "steps": steps, "reviews": reviews}
@@ -866,22 +1044,27 @@ if __name__ == "__main__":
     with executor:  # a Vercel sandbox is destroyed when this block ends, even after an error
         # Team mode: the database starter, and the tester writes the tests. Otherwise: the todo app + built-in tests.
         seed_workspace(executor, include_tests=not description, template=TEMPLATE_DB if description else TEMPLATE)
+        meter = model_client.UsageMeter()
 
         if description:
             print("\n=== Tester ===")
             tester = run_agent(workspace, on_step=print_step, role="tester",
-                               start_message=tester_message(description), max_steps=12, executor=executor)
+                               start_message=tester_message(description), max_steps=12, executor=executor, meter=meter)
             print(f"Tester {'done' if tester['passed'] else 'FAILED'}: {tester['test_output'].strip().splitlines()[-1]}")
             if not tester["passed"]:
                 sys.exit(1)
             print("\n=== Builder ===")
 
+        saved_tests = save_tests(executor)  # our own copy, before any generated app code has run
         outcome = run_agent(workspace, on_step=print_step, max_steps=25 if description else 15, executor=executor,
-                            system_prompt=BUILDER_DB_PROMPT if description else None, reviewable=bool(description))
+                            system_prompt=BUILDER_DB_PROMPT if description else None, reviewable=bool(description),
+                            meter=meter)
         if description:  # the feedback loop: a stuck builder gets its failing tests re-checked by the tester
             outcome = review_rounds(workspace, executor, outcome,
                                     step_logger=lambda label, role: (lambda event: print_step(event, label)),
-                                    on_note=lambda text, output="": print(f"\n=== Orchestrator: {text} ==="))
+                                    on_note=lambda text, output="": print(f"\n=== Orchestrator: {text} ==="),
+                                    saved_tests=saved_tests, meter=meter)
+        outcome = verify_outcome(executor, saved_tests, outcome)
 
         # Keep a local copy of the result: a Vercel sandbox (and its files) disappears when the block ends.
         for path in executor.list_files():
@@ -894,3 +1077,6 @@ if __name__ == "__main__":
     verdict = "DONE, verified" if outcome["passed"] else "NOT DONE"
     print(f"\n{verdict} after {outcome['steps']} steps: {outcome['test_output'].strip().splitlines()[-1]}")
     print(f"Time: {time.time() - started:.0f}s    Code: {workspace / 'app' / 'main.py'}")
+    used = meter.totals()
+    print(f"Model usage: {used['requests']} requests, {used['input_tokens'] + used['output_tokens']:,} tokens, "
+          f"${used['cost_usd']:.4f}{'' if used['cost_complete'] else ' (some costs not reported)'}")

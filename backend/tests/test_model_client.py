@@ -12,7 +12,7 @@ from google.genai import types
 import orchestration  # noqa: F401  (puts the repo root on the import path)
 from orchestrator import agent, model_client
 from orchestrator.executors import LocalExecutor
-from orchestrator.model_client import ToolCall, ToolSpec
+from orchestrator.model_client import ToolCall, ToolSpec, Usage, UsageMeter
 
 READ_FILE = ToolSpec(
     name="read_file",
@@ -416,6 +416,76 @@ def test_an_error_on_the_choice_is_an_error_and_keeps_no_partial_text(api):
     chat.send("openrouter/deepseek/test-model")
 
     assert len(api.requests[1].body["messages"]) == 2
+
+
+# ---- Token and cost tracking ----
+
+def test_gemini_usage_is_read_including_thinking_tokens(gemini):
+    reply = gemini_reply(types.Part(text="ok"))
+    reply.usage_metadata = types.GenerateContentResponseUsageMetadata(
+        prompt_token_count=100, cached_content_token_count=40, candidates_token_count=10, thoughts_token_count=5)
+    gemini.replies = [reply]
+    chat = conversation()
+
+    usage = chat.record(chat.send("some-model")).usage
+
+    assert usage == Usage(input_tokens=100, cached_tokens=40, output_tokens=15, cost_usd=None)
+
+
+def test_a_gemini_reply_without_usage_is_fine(gemini):
+    gemini.replies = [gemini_reply(types.Part(text="ok"))]
+    chat = conversation()
+
+    assert chat.record(chat.send("some-model")).usage is None
+
+
+def test_openai_style_usage_includes_cached_tokens_and_cost(api):
+    response = api_reply("ok")
+    data = response.json()
+    data["usage"] = {"prompt_tokens": 200, "completion_tokens": 20, "cost": 0.0012,
+                     "prompt_tokens_details": {"cached_tokens": 150}}
+    api.replies = [httpx2.Response(200, json=data)]
+    chat = groq_chat()
+
+    usage = chat.record(chat.send("groq/test-model")).usage
+
+    assert usage == Usage(input_tokens=200, cached_tokens=150, output_tokens=20, cost_usd=0.0012)
+
+
+def test_openai_style_reply_without_usage_is_fine(api):
+    api.replies = [api_reply("ok")]
+    chat = groq_chat()
+
+    assert chat.record(chat.send("groq/test-model")).usage is None
+
+
+def test_the_meter_adds_up_a_whole_project():
+    meter = UsageMeter()
+    meter.add("cheap", Usage(100, 40, 10, 0.001), "tester")
+    meter.add("cheap", Usage(300, 200, 20, 0.002), "builder")
+    meter.failed()
+
+    totals = meter.totals()
+
+    assert (totals["requests"], totals["failed_attempts"]) == (2, 1)
+    assert (totals["input_tokens"], totals["cached_tokens"], totals["output_tokens"]) == (400, 240, 30)
+    assert totals["cost_usd"] == pytest.approx(0.003) and totals["cost_complete"] is True
+    assert totals["largest_request"] == 320
+    assert totals["by_stage"]["tester"]["input_tokens"] == 100
+    assert totals["steps"][1] == {"stage": "builder", "model": "cheap", "input": 300, "cached": 200, "output": 20,
+                                  "cost": 0.002}
+
+
+def test_the_meter_says_when_a_cost_is_unknown():
+    meter = UsageMeter()
+    meter.add("priced", Usage(10, 0, 1, 0.001), "builder")
+    meter.add("free", Usage(10, 0, 1, None), "builder")
+    meter.add("silent", None, "builder")
+
+    totals = meter.totals()
+
+    assert totals["cost_usd"] == pytest.approx(0.001) and totals["cost_complete"] is False
+    assert totals["requests"] == 3
 
 
 # ---- The real agent loop running on an OpenAI-style provider ----

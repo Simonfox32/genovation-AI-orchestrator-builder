@@ -17,6 +17,8 @@ CODE = "from fastapi import FastAPI\n\napp = FastAPI()  # pretend this is the fi
 @pytest.fixture(autouse=True)
 def agent_mode(monkeypatch):
     monkeypatch.setenv("ORCHESTRATOR", "agent")
+    # These fake agents don't build real apps. The real final check is tested in test_verification.py.
+    monkeypatch.setattr(orchestration.agent, "verify_outcome", lambda executor, saved_tests, outcome: outcome)
 
 
 def submit(description="Build me a todo app"):

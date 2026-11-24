@@ -8,6 +8,7 @@ What is real depends on configuration:
   - ROUTER_TOOLS=real:     the router asks Gemini to write each module's code; otherwise it uses
                            simulated tools that return hard-coded code.
 """
+import json
 import logging
 import os
 import sys
@@ -167,6 +168,7 @@ def run_agent_pipeline(project_id: UUID, session_factory, with_tester: bool = Fa
         workspace = workspace_root / "workspace"  # only used by the local executor
         model = agent.model_for(project.optimization)  # Fastest / Balanced / Best Quality -> cheap / medium / strong
         tester = None
+        meter = agent.model_client.UsageMeter()  # tokens and cost across every agent in this project
         executor = make_executor(workspace)
         # Team mode: the database starter, and the tester writes its own tests. Otherwise: the todo app + its tests.
         agent.seed_workspace(executor, include_tests=not with_tester,
@@ -199,13 +201,14 @@ def run_agent_pipeline(project_id: UUID, session_factory, with_tester: bool = Fa
         if with_tester:
             tester = agent.run_agent(workspace, on_step=make_saver("Tester · ", tester=True), role="tester",
                                      start_message=agent.tester_message(project.description), max_steps=12,
-                                     model=model, executor=executor)
+                                     model=model, executor=executor, meter=meter)
             if not tester["passed"]:
                 project.tasks.append(Task(
                     id=uuid4(), position=len(project.tasks) + 1,
                     name="The tester agent could not produce valid tests", description=tester["summary"],
                     tool="pytest", status="failed", attempts=1, output=tester["test_output"][-2000:],
                 ))
+                _save_usage(project, meter)
                 project.status = "failed"
                 project.summary = ("The tester agent could not turn the description into valid tests "
                                    f"({tester['summary']}). Try a more concrete description.")
@@ -219,10 +222,11 @@ def run_agent_pipeline(project_id: UUID, session_factory, with_tester: bool = Fa
             _touch(project)
             db.commit()
 
+        saved_tests = agent.save_tests(executor)  # our own copy, taken before any generated app code has run
         outcome = agent.run_agent(workspace, on_step=make_saver("Builder · " if with_tester else ""),
                                   max_steps=25 if with_tester else 15, model=model, executor=executor,
                                   system_prompt=agent.BUILDER_DB_PROMPT if with_tester else None,
-                                  reviewable=with_tester)
+                                  reviewable=with_tester, meter=meter)
 
         if with_tester:
             # The feedback loop: if the builder is stuck, the tester re-checks the failing tests (C4).
@@ -236,7 +240,9 @@ def run_agent_pipeline(project_id: UUID, session_factory, with_tester: bool = Fa
                 db.commit()
 
             outcome = agent.review_rounds(workspace, executor, outcome, model=model, on_note=save_note,
-                                          step_logger=lambda label, role: make_saver(label, tester=role == "tester"))
+                                          step_logger=lambda label, role: make_saver(label, tester=role == "tester"),
+                                          saved_tests=saved_tests, meter=meter)
+        outcome = agent.verify_outcome(executor, saved_tests, outcome)  # never take an agent's word for it
         agents = "AI agents" if with_tester else "An AI agent"
         models = _model_note(model, *([tester] if tester else []), outcome, *outcome.get("reviews", []))
         reviews = _review_note(outcome.get("reviews", []))
@@ -249,6 +255,7 @@ def run_agent_pipeline(project_id: UUID, session_factory, with_tester: bool = Fa
             status="completed" if outcome["passed"] else "failed", attempts=1,
             output=outcome["test_output"][-2000:],
         ))
+        _save_usage(project, meter)
         if outcome["passed"]:
             project.status = "completed"
             project.summary = (f"{agents} ({models}) built {what} in {outcome['steps']} steps. "
@@ -311,6 +318,24 @@ def _count_requirements(executor) -> int:
     if "tests/REQUIREMENTS.md" not in executor.list_files("tests"):
         return 0
     return len(agent.requirement_numbers(executor.read_file("tests/REQUIREMENTS.md")))
+
+
+def _save_usage(project: Project, meter) -> None:
+    """One task row with what the models used, so tokens and cost are visible without a database change."""
+    totals = meter.totals()
+    if not totals["requests"]:
+        return
+    tokens = totals["input_tokens"] + totals["output_tokens"]
+    if totals["cost_complete"]:
+        cost = f"${totals['cost_usd']:.4f}"
+    else:
+        cost = f"at least ${totals['cost_usd']:.4f}" if totals["cost_usd"] else "cost not reported"
+    project.tasks.append(Task(
+        id=uuid4(), position=len(project.tasks) + 1,
+        name=f"Model usage: {totals['requests']} requests, {tokens:,} tokens ({totals['cached_tokens']:,} cached), {cost}"[:200],
+        description="What the AI models used for this project", tool="orchestrator", status="completed", attempts=1,
+        output=json.dumps(totals),
+    ))
 
 
 def _model_note(chosen: str, *outcomes) -> str:

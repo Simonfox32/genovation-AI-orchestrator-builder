@@ -71,10 +71,78 @@ class ToolCall:
 
 
 @dataclass(frozen=True)
+class Usage:
+    """What one model reply used. `cost_usd` is None when the provider doesn't report a price."""
+    input_tokens: int = 0
+    cached_tokens: int = 0  # the part of input_tokens served from the provider's cache, usually far cheaper
+    output_tokens: int = 0
+    cost_usd: float | None = None
+
+
+@dataclass(frozen=True)
 class ModelReply:
     """What the model said: some text, and any tools it wants run. No calls means it thinks it's finished."""
     text: str
     calls: list[ToolCall]
+    usage: Usage | None = None
+
+
+class UsageMeter:
+    """Adds up what the models used across one project: per request, per stage (tester, builder, review), and total."""
+
+    def __init__(self):
+        self.steps, self.failed_attempts = [], 0
+
+    def add(self, model, usage, stage):
+        used = usage or Usage()
+        self.steps.append({"stage": stage, "model": model, "input": used.input_tokens, "cached": used.cached_tokens,
+                           "output": used.output_tokens, "cost": used.cost_usd})
+
+    def failed(self):
+        """A model call that errored and was retried. Providers normally don't bill these, but they cost time."""
+        self.failed_attempts += 1
+
+    def totals(self):
+        by_stage = {}
+        for step in self.steps:
+            stage = by_stage.setdefault(step["stage"], {"requests": 0, "input_tokens": 0, "cached_tokens": 0,
+                                                        "output_tokens": 0, "cost_usd": 0.0})
+            stage["requests"] += 1
+            stage["input_tokens"] += step["input"]
+            stage["cached_tokens"] += step["cached"]
+            stage["output_tokens"] += step["output"]
+            stage["cost_usd"] += step["cost"] or 0.0
+        return {
+            "requests": len(self.steps),
+            "failed_attempts": self.failed_attempts,
+            "input_tokens": sum(step["input"] for step in self.steps),
+            "cached_tokens": sum(step["cached"] for step in self.steps),
+            "output_tokens": sum(step["output"] for step in self.steps),
+            "cost_usd": sum(step["cost"] or 0.0 for step in self.steps),
+            "cost_complete": bool(self.steps) and all(step["cost"] is not None for step in self.steps),
+            "largest_request": max((step["input"] + step["output"] for step in self.steps), default=0),
+            "by_stage": by_stage,
+            "steps": self.steps,
+        }
+
+
+def _gemini_usage(response):
+    usage = getattr(response, "usage_metadata", None)
+    if usage is None:
+        return None
+    return Usage(input_tokens=usage.prompt_token_count or 0, cached_tokens=usage.cached_content_token_count or 0,
+                 output_tokens=(usage.candidates_token_count or 0) + (usage.thoughts_token_count or 0))
+
+
+def _openai_usage(response):
+    usage = response.get("usage")
+    if not usage:
+        return None
+    cost = usage.get("cost")  # OpenRouter reports the real price of each request
+    return Usage(input_tokens=usage.get("prompt_tokens") or 0,
+                 cached_tokens=(usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0,
+                 output_tokens=usage.get("completion_tokens") or 0,
+                 cost_usd=float(cost) if cost is not None else None)
 
 
 class GeminiConversation:
@@ -100,7 +168,7 @@ class GeminiConversation:
         self._history.append(response.candidates[0].content)
         calls = [ToolCall(id=call.id, name=call.name, args=dict(call.args or {}))
                  for call in response.function_calls or []]
-        return ModelReply(text="" if calls else response.text or "", calls=calls)
+        return ModelReply(text="" if calls else response.text or "", calls=calls, usage=_gemini_usage(response))
 
     def add_tool_results(self, results):
         """results: [(ToolCall, result text), ...], all sent back together as one turn."""
@@ -187,7 +255,7 @@ class OpenAIStyleConversation:
         if sent_back:
             turn["tool_calls"] = sent_back
         self._messages.append(turn)
-        return ModelReply(text="" if calls else turn["content"], calls=calls)
+        return ModelReply(text="" if calls else turn["content"], calls=calls, usage=_openai_usage(response))
 
     def add_tool_results(self, results):
         """results: [(ToolCall, result text), ...], one message per tool call."""
