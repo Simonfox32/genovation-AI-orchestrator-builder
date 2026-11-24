@@ -213,7 +213,7 @@ def test_overloaded_model_falls_back_to_the_medium_model(workspace, monkeypatch)
             content = types.Content(role="model", parts=[types.Part(text="All done.")])
             return SimpleNamespace(candidates=[SimpleNamespace(content=content)], function_calls=None, text="All done.")
 
-    monkeypatch.setattr(agent.genai, "Client", lambda **settings: SimpleNamespace(models=FakeModels()))
+    monkeypatch.setattr(agent.model_client.genai, "Client", lambda **settings: SimpleNamespace(models=FakeModels()))
     monkeypatch.setattr(agent.time, "sleep", lambda seconds: None)
 
     outcome = agent.run_agent(workspace, model=agent.STRONG_MODEL, max_steps=1)
@@ -247,7 +247,7 @@ def test_rate_limit_waits_longer_and_keeps_the_model(workspace, monkeypatch):
             content = types.Content(role="model", parts=[types.Part(text="All done.")])
             return SimpleNamespace(candidates=[SimpleNamespace(content=content)], function_calls=None, text="All done.")
 
-    monkeypatch.setattr(agent.genai, "Client", lambda **settings: SimpleNamespace(models=FakeModels()))
+    monkeypatch.setattr(agent.model_client.genai, "Client", lambda **settings: SimpleNamespace(models=FakeModels()))
     monkeypatch.setattr(agent.time, "sleep", waits.append)
 
     agent.run_agent(workspace, model=agent.MEDIUM_MODEL, max_steps=1)
@@ -333,7 +333,7 @@ def fake_gemini(monkeypatch, calls_for_turn):
             return SimpleNamespace(candidates=[SimpleNamespace(content=types.Content(role="model", parts=parts))],
                                    function_calls=asked, text=None)
 
-    monkeypatch.setattr(agent.genai, "Client", lambda **settings: SimpleNamespace(models=FakeModels()))
+    monkeypatch.setattr(agent.model_client.genai, "Client", lambda **settings: SimpleNamespace(models=FakeModels()))
     return configs
 
 
@@ -673,3 +673,16 @@ def test_database_template_readme_commands_are_safe_to_paste():
     for command in commands:
         assert len(command.strip().splitlines()) == 1, command
         assert "#" not in command, command
+
+
+def test_an_openrouter_key_sends_every_setting_to_one_low_cost_model(monkeypatch):
+    monkeypatch.setenv("OPEN_ROUTER_API_KEY", "fake")
+    monkeypatch.delenv("AGENT_MODEL", raising=False)
+
+    assert {agent.model_for(setting) for setting in ("speed", "balanced", "quality")} == {agent.OPENROUTER_MODEL}
+
+    monkeypatch.setenv("AGENT_MODEL", "openrouter/deepseek/some-model")
+    assert agent.model_for("quality") == "openrouter/deepseek/some-model"
+
+    monkeypatch.delenv("OPEN_ROUTER_API_KEY")
+    assert agent.model_for("quality") == agent.STRONG_MODEL
