@@ -43,6 +43,12 @@ REVIEW_STEPS = 10   # steps for one tester review (a real one, replaying 11-18's
 RETRY_STEPS = 15    # steps for each extra builder round (a fresh history, so it starts fast again)
 TEST_OUTPUT_LIMIT = 4000  # characters of one test run the model reads. Our own checks always read all of it.
 FAILURES_LISTED = 20      # failing tests named in a shortened run; the full count is always given
+TESTER_STEPS, TESTER_STEPS_MAX = 12, 30    # a longer request gets more steps, up to the limit
+BUILDER_STEPS, BUILDER_STEPS_MAX = 25, 60  # more tests get more steps, up to the limit
+REVIEW_MAX_TESTS = 5  # more failing tests than this means unfinished work, not a few suspicious tests
+MAX_RETRY_WAIT = 120  # seconds. If a provider asks for longer (a daily quota), stop now instead of hanging the build
+CUT_OFF_MESSAGE = ("Your last reply was cut off because it was too long. Continue from where you stopped, and write "
+                   "less at once: use smaller files.")
 
 # The dashboard's Optimization setting -> which Gemini model the agents use.
 MODELS_BY_OPTIMIZATION = {"speed": CHEAP_MODEL, "balanced": MEDIUM_MODEL, "quality": STRONG_MODEL}
@@ -51,6 +57,28 @@ MODELS_BY_OPTIMIZATION = {"speed": CHEAP_MODEL, "balanced": MEDIUM_MODEL, "quali
 def model_for(optimization):
     """The model for an optimization setting ('speed', 'balanced', 'quality'); unknown settings get the default."""
     return MODELS_BY_OPTIMIZATION.get(optimization, MODEL)
+
+
+def tester_steps(description):
+    """Steps for the tester: about one more per 1,000 characters of request."""
+    return min(TESTER_STEPS_MAX, TESTER_STEPS + len(description) // 1000)
+
+
+def builder_steps(test_count):
+    """Steps for the builder. Real builds used roughly 10 + one per test."""
+    return min(BUILDER_STEPS_MAX, max(BUILDER_STEPS, 10 + test_count))
+
+
+def retry_steps(test_count):
+    """Steps for each extra builder round."""
+    return max(RETRY_STEPS, builder_steps(test_count) // 2)
+
+
+def permanent_reason(status, model):
+    """A plain explanation for an error retrying can't fix. Never includes the provider's raw text."""
+    problem = {401: "rejected the API key", 402: "has no credits left", 403: "refused access",
+               404: "doesn't offer this model", 413: "said the request is too large"}.get(status, "rejected the request")
+    return f"The AI provider {problem} for {model}."
 
 
 TEMPLATE = Path(__file__).parent / "agent_template"        # in-memory todo app + its built-in tests (ORCHESTRATOR=agent)
@@ -227,6 +255,19 @@ def retry_message(failing, verdict, tests_changed, decided=True):
     return (f"You worked on this project before, but these tests kept failing: {', '.join(failing)}.\n"
             f"{change} The tester's verdict: {verdict or '(none given)'}\n\n"
             "The files are as you left them. Read what you need, then make every test pass.")
+
+
+def continue_message(failing, test_output):
+    """The builder's first message when it simply ran out of steps: nobody doubts the tests, so it keeps building."""
+    if failing:
+        more = f" and {len(failing) - FAILURES_LISTED} more" if len(failing) > FAILURES_LISTED else ""
+        what = f"{len(failing)} tests still fail: {', '.join(failing[:FAILURES_LISTED])}{more}."
+    else:
+        what = "The tests don't load yet, so fix that first."
+    return (f"You worked on this project before and ran out of steps. {what}\n\n"
+            f"The latest test output:\n{test_output[-3000:]}\n\n"
+            "The files are as you left them. Read what you need, then make every test pass.")
+
 
 # ---- The tool menu: what the model reads to decide which tool to ask for ----
 
@@ -643,19 +684,29 @@ def run_agent(workspace, on_step=None, model=MODEL, max_steps=15, system_prompt=
             try:
                 return conversation.send(current["model"])
             except Exception as error:
-                rate_limited = "429" in str(error) or "RESOURCE_EXHAUSTED" in str(error)
-                wait = attempt * (10 if rate_limited else 3)
+                status = model_client.error_status(error)
+                rate_limited = status == 429
+                asked = model_client.retry_delay(error)  # how long the provider told us to wait, if it said
                 if meter:
                     meter.failed()
-                print(f"   (Model error on {current['model']}, retrying in {wait}s: {str(error)[:60]})")
                 # The history is in one provider's format, so a fallback only works within the same provider.
-                if (not rate_limited and current["model"] != FALLBACK_MODEL
-                        and model_client.same_provider(current["model"], FALLBACK_MODEL)):
+                can_fall_back = (not rate_limited and current["model"] != FALLBACK_MODEL
+                                 and model_client.same_provider(current["model"], FALLBACK_MODEL))
+                if not can_fall_back:
+                    if model_client.is_permanent(error):  # a bad key or oversized request won't fix itself
+                        raise model_client.ModelUnavailable(permanent_reason(status, current["model"])) from error
+                    if asked is not None and asked > MAX_RETRY_WAIT:  # e.g. a daily quota: don't hold the build open
+                        raise model_client.ModelUnavailable(
+                            f"{current['model']} is out of quota. The provider says to try again in "
+                            f"{asked / 3600:.1f} hours.") from error
+                wait = min(asked, MAX_RETRY_WAIT) if asked is not None else attempt * (10 if rate_limited else 3)
+                print(f"   (Model error on {current['model']}, retrying in {wait}s: {str(error)[:60]})")
+                if can_fall_back:
                     print(f"   (switching to the fallback model {FALLBACK_MODEL})")
                     current["model"] = FALLBACK_MODEL
                 if attempt < MAX_ATTEMPTS:
                     time.sleep(wait)
-        raise RuntimeError(f"{current['model']} unavailable after {MAX_ATTEMPTS} attempts")
+        raise model_client.ModelUnavailable(f"{current['model']} unavailable after {MAX_ATTEMPTS} attempts.")
 
     def stopped(step, output, summary, **extra):
         return {"passed": False, "steps": step, "summary": summary, "test_output": output,
@@ -674,8 +725,12 @@ def run_agent(workspace, on_step=None, model=MODEL, max_steps=15, system_prompt=
         reply = conversation.record(ask_model())
         if meter:
             meter.add(current["model"], reply.usage, "review" if review else role)
+            meter.check_budget()
 
         calls = reply.calls
+        if reply.cut_off and not calls:  # it ran out of room mid-sentence, so it hasn't said it's finished
+            conversation.add_text(CUT_OFF_MESSAGE)
+            continue
         if not calls:
             # The model says it's finished. Don't take its word for it: check ourselves.
             done, output, feedback = done_check(tools)
@@ -956,17 +1011,27 @@ def review_rounds(workspace, executor, outcome, model=MODEL, step_logger=None, o
     note = on_note or (lambda text, output="": None)
     logger = step_logger or (lambda label, role: None)
     reviews, steps = [], outcome["steps"]
+    test_count = count_test_functions(saved_tests) if saved_tests else 0
 
     for round_number in range(1, rounds + 1):
         if outcome["passed"]:
             break
         dispute = outcome.get("disputed")
-        failing = [dispute["test"]] if dispute else (outcome.get("stuck") or sorted(failing_tests(outcome["test_output"])))
-        if not failing:
-            note("No test to review: the code itself doesn't load", outcome["test_output"])
-            break
-        why = (f"the developer reported {dispute['test']}" if dispute else
-               "the developer stopped making progress" if outcome.get("stuck") else "the developer ran out of steps")
+        stuck = outcome.get("stuck") or []
+        if not dispute and not 0 < len(stuck) <= REVIEW_MAX_TESTS:
+            # Nobody doubts the tests: the work just isn't finished. A review here would burn calls deciding
+            # whether every unbuilt feature's test is "wrong", so keep building instead.
+            remaining = sorted(failing_tests(outcome["test_output"]))
+            note(f"Round {round_number}: the developer isn't finished ({len(remaining)} tests failing), so it keeps "
+                 "building", outcome["test_output"])
+            outcome = run_agent(workspace, on_step=logger(f"Builder (round {round_number + 1}) · ", "builder"),
+                                model=model, max_steps=retry_steps(test_count), system_prompt=BUILDER_DB_PROMPT,
+                                executor=executor, start_message=continue_message(remaining, outcome["test_output"]),
+                                reviewable=True, meter=meter)
+            steps += outcome["steps"]
+            continue
+        failing = [dispute["test"]] if dispute else stuck
+        why = f"the developer reported {dispute['test']}" if dispute else "the developer stopped making progress"
         note(f"Review {round_number}: {why}, so the tester re-checks {', '.join(failing)}", outcome["test_output"])
 
         if saved_tests is not None:  # the review must see the real tests, whatever the app's code did to the files
@@ -1005,8 +1070,8 @@ def review_rounds(workspace, executor, outcome, model=MODEL, step_logger=None, o
             break
 
         outcome = run_agent(workspace, on_step=logger(f"Builder (round {round_number + 1}) · ", "builder"),
-                            model=model, max_steps=RETRY_STEPS, system_prompt=BUILDER_DB_PROMPT, executor=executor,
-                            start_message=retry_message(failing, verdict, changed, bool(fixed or upheld)),
+                            model=model, max_steps=retry_steps(test_count), system_prompt=BUILDER_DB_PROMPT,
+                            executor=executor, start_message=retry_message(failing, verdict, changed, bool(fixed or upheld)),
                             reviewable=True, meter=meter)
         steps += outcome["steps"]
 
@@ -1044,19 +1109,20 @@ if __name__ == "__main__":
     with executor:  # a Vercel sandbox is destroyed when this block ends, even after an error
         # Team mode: the database starter, and the tester writes the tests. Otherwise: the todo app + built-in tests.
         seed_workspace(executor, include_tests=not description, template=TEMPLATE_DB if description else TEMPLATE)
-        meter = model_client.UsageMeter()
+        meter = model_client.UsageMeter.for_project()
 
         if description:
             print("\n=== Tester ===")
-            tester = run_agent(workspace, on_step=print_step, role="tester",
-                               start_message=tester_message(description), max_steps=12, executor=executor, meter=meter)
+            tester = run_agent(workspace, on_step=print_step, role="tester", start_message=tester_message(description),
+                               max_steps=tester_steps(description), executor=executor, meter=meter)
             print(f"Tester {'done' if tester['passed'] else 'FAILED'}: {tester['test_output'].strip().splitlines()[-1]}")
             if not tester["passed"]:
                 sys.exit(1)
             print("\n=== Builder ===")
 
         saved_tests = save_tests(executor)  # our own copy, before any generated app code has run
-        outcome = run_agent(workspace, on_step=print_step, max_steps=25 if description else 15, executor=executor,
+        outcome = run_agent(workspace, on_step=print_step, executor=executor,
+                            max_steps=builder_steps(count_test_functions(saved_tests)) if description else 15,
                             system_prompt=BUILDER_DB_PROMPT if description else None, reviewable=bool(description),
                             meter=meter)
         if description:  # the feedback loop: a stuck builder gets its failing tests re-checked by the tester

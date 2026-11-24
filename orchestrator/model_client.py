@@ -19,6 +19,7 @@ This file isn't called models.py because backend/models.py already owns that imp
 """
 import json
 import os
+import re
 from dataclasses import dataclass
 
 import httpx2
@@ -33,6 +34,69 @@ OPENAI_STYLE = {
     "cerebras": ("https://api.cerebras.ai/v1", "CEREBRAS_API_KEY"),
 }
 OPENROUTER_MAX_OUTPUT = 16_000  # most tokens one reply may use: limits a runaway reply's cost on a prepaid key
+DEFAULT_MAX_PROJECT_COST_USD = 0.50  # one build stops here. Override with MAX_PROJECT_COST_USD
+DEFAULT_MAX_PROJECT_TOKENS = 3_000_000  # for providers that don't report a price. Override with MAX_PROJECT_TOKENS
+PERMANENT_STATUSES = {400, 401, 403, 404, 413, 422}  # sending the same request again can't fix these
+CUT_OFF_CALL = ("Your reply was cut off before this tool call was complete, so it did not run. "
+                "Write less at once: use smaller files.")
+
+
+class ProviderError(RuntimeError):
+    """An error answer from a provider, keeping the facts the retry logic needs."""
+
+    def __init__(self, status, message, retry_after=None):
+        super().__init__(f"{status} {message}")
+        self.status, self.retry_after = status, retry_after
+
+
+class ModelUnavailable(RuntimeError):
+    """A build can't continue with this model. `public` is safe to show users: no keys or raw provider text."""
+
+    def __init__(self, public):
+        super().__init__(public)
+        self.public = public
+
+
+def error_status(error):
+    """The HTTP status behind an error, from the error's fields or the start of its message. Only the start counts:
+    a request id containing '429' in the middle of a message is not a rate limit."""
+    for field in ("status", "code"):
+        value = getattr(error, field, None)
+        if isinstance(value, int):
+            return value
+    match = re.match(r"\s*(\d{3})\b", str(error))
+    if match:
+        return int(match.group(1))
+    return 429 if "RESOURCE_EXHAUSTED" in str(error) else None
+
+
+def retry_delay(error):
+    """How many seconds the provider asked us to wait, or None if it didn't say."""
+    value = getattr(error, "retry_after", None)
+    if value is not None:
+        return value
+    try:  # Gemini: {"error": {"details": [{"retryDelay": "35784s"}]}}
+        for item in error.details["error"]["details"]:
+            if "retryDelay" in item:
+                return float(item["retryDelay"].rstrip("s"))
+    except (AttributeError, KeyError, TypeError, ValueError):
+        pass
+    return None
+
+
+def is_permanent(error):
+    """Would retrying the same request be pointless? A 402 with a retry time is OpenRouter's temporary budget check."""
+    status = error_status(error)
+    if status == 402:
+        return retry_delay(error) is None
+    return status in PERMANENT_STATUSES
+
+
+def _retry_after(headers):
+    try:
+        return float(headers.get("retry-after"))
+    except (TypeError, ValueError):
+        return None
 
 
 def split_model(name):
@@ -85,13 +149,27 @@ class ModelReply:
     text: str
     calls: list[ToolCall]
     usage: Usage | None = None
+    cut_off: bool = False  # the reply hit its length limit, so it may stop mid-sentence or mid-tool-call
 
 
 class UsageMeter:
-    """Adds up what the models used across one project: per request, per stage (tester, builder, review), and total."""
+    """Adds up what the models used across one project: per request, per stage (tester, builder, review), and total.
+    With limits set, check_budget() stops a build before it can spend more."""
 
-    def __init__(self):
+    def __init__(self, max_cost_usd=None, max_tokens=None):
         self.steps, self.failed_attempts = [], 0
+        self.max_cost_usd, self.max_tokens = max_cost_usd, max_tokens
+
+    @classmethod
+    def for_project(cls):
+        return cls(max_cost_usd=float(os.getenv("MAX_PROJECT_COST_USD", DEFAULT_MAX_PROJECT_COST_USD)),
+                   max_tokens=int(os.getenv("MAX_PROJECT_TOKENS", DEFAULT_MAX_PROJECT_TOKENS)))
+
+    def check_budget(self):
+        if self.max_cost_usd is not None and sum(step["cost"] or 0.0 for step in self.steps) >= self.max_cost_usd:
+            raise ModelUnavailable(f"This build reached its ${self.max_cost_usd:.2f} spending limit.")
+        if self.max_tokens is not None and sum(step["input"] + step["output"] for step in self.steps) >= self.max_tokens:
+            raise ModelUnavailable(f"This build reached its {self.max_tokens:,} token limit.")
 
     def add(self, model, usage, stage):
         used = usage or Usage()
@@ -159,16 +237,24 @@ class GeminiConversation:
 
     def send(self, model):
         """One request to the model. Raises if it fails, leaving the conversation unchanged."""
-        return self._client.models.generate_content(model=split_model(model)[1], contents=self._history,
-                                                    config=self._config)
+        response = self._client.models.generate_content(model=split_model(model)[1], contents=self._history,
+                                                        config=self._config)
+        if not response.candidates:  # e.g. blocked by a safety filter: treat it like any other failed request
+            raise RuntimeError("Gemini returned no reply")
+        return response
 
     def record(self, response):
         """Add the model's turn to the conversation and return it in the neutral shape."""
         # Keep Gemini's own object: it can carry thought signatures that later requests must send back unchanged.
-        self._history.append(response.candidates[0].content)
+        candidate = response.candidates[0]
+        content = candidate.content
+        if content is None or not content.parts:  # an empty turn in the history would make the next request invalid
+            content = types.Content(role="model", parts=[types.Part(text="(no reply)")])
+        self._history.append(content)
         calls = [ToolCall(id=call.id, name=call.name, args=dict(call.args or {}))
                  for call in response.function_calls or []]
-        return ModelReply(text="" if calls else response.text or "", calls=calls, usage=_gemini_usage(response))
+        return ModelReply(text="" if calls else response.text or "", calls=calls, usage=_gemini_usage(response),
+                          cut_off=getattr(candidate, "finish_reason", None) == types.FinishReason.MAX_TOKENS)
 
     def add_tool_results(self, results):
         """results: [(ToolCall, result text), ...], all sent back together as one turn."""
@@ -181,8 +267,8 @@ class GeminiConversation:
         self._history.append(types.Content(role="user", parts=[types.Part(text=text)]))
 
 
-def _read_tool_call(raw):
-    """OpenAI-style tool arguments arrive as JSON text, and models sometimes write it badly."""
+def _read_tool_call(raw, cut_off=False):
+    """OpenAI-style tool arguments arrive as JSON text, and models sometimes write it badly or run out of room."""
     function = raw["function"]
     arguments = function.get("arguments") or "{}"
     try:
@@ -191,7 +277,7 @@ def _read_tool_call(raw):
         args = None
     if not isinstance(args, dict):
         return ToolCall(id=raw.get("id"), name=function["name"], args={},
-                        error="The tool arguments were not a valid JSON object")
+                        error=CUT_OFF_CALL if cut_off else "The tool arguments were not a valid JSON object")
     return ToolCall(id=raw.get("id"), name=function["name"], args=args)
 
 
@@ -210,9 +296,9 @@ class OpenAIStyleConversation:
                                                          "parameters": tool.parameters}} for tool in tools]
         self._messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": first_message}]
 
-    def _failure(self, status, text):
-        """An error that keeps the status (the retry logic reads it) and can never contain the key."""
-        return RuntimeError(f"{status} from {self._provider}: {text.replace(self._key, '[key]')[:300]}")
+    def _failure(self, status, text, retry_after=None):
+        """An error that keeps the status and retry time (the retry logic reads them) and can never contain the key."""
+        return ProviderError(status, f"from {self._provider}: {text.replace(self._key, '[key]')[:300]}", retry_after)
 
     def _request_body(self, model):
         name = split_model(model)[1]
@@ -230,24 +316,28 @@ class OpenAIStyleConversation:
         response = httpx2.post(self._url, headers={"Authorization": f"Bearer {self._key}"}, timeout=self._timeout,
                                json=self._request_body(model))
         if response.status_code != 200:
-            raise self._failure(response.status_code, response.text)
+            raise self._failure(response.status_code, response.text, _retry_after(response.headers))
         data = response.json()
         # OpenRouter can answer 200 with an error at the top level, or on the choice next to partial content.
         choices = data.get("choices") or []
         error = data.get("error") or (choices[0].get("error") if choices else None)
         if error or not choices:
-            raise self._failure(response.status_code, json.dumps(error) if error else response.text)
+            code = error.get("code") if isinstance(error, dict) else None
+            raise self._failure(code if isinstance(code, int) else 502, json.dumps(error) if error else response.text,
+                                _retry_after(response.headers))
         return data
 
     def record(self, response):
         """Add the model's turn to the conversation and return it in the neutral shape."""
-        message = response["choices"][0]["message"]
+        choice = response["choices"][0]
+        message = choice["message"]
+        cut_off = choice.get("finish_reason") == "length"
         turn = {"role": "assistant", "content": message.get("content") or ""}
         if message.get("reasoning_details"):  # OpenRouter needs these back; other private reasoning stays out
             turn["reasoning_details"] = message["reasoning_details"]
         calls, sent_back = [], []
         for raw in message.get("tool_calls") or []:
-            call = _read_tool_call(raw)
+            call = _read_tool_call(raw, cut_off)
             calls.append(call)
             # Providers can reject a history containing broken or empty argument text.
             usable = not call.error and raw["function"].get("arguments")
@@ -255,7 +345,8 @@ class OpenAIStyleConversation:
         if sent_back:
             turn["tool_calls"] = sent_back
         self._messages.append(turn)
-        return ModelReply(text="" if calls else turn["content"], calls=calls, usage=_openai_usage(response))
+        return ModelReply(text="" if calls else turn["content"], calls=calls, usage=_openai_usage(response),
+                          cut_off=cut_off)
 
     def add_tool_results(self, results):
         """results: [(ToolCall, result text), ...], one message per tool call."""

@@ -418,6 +418,154 @@ def test_an_error_on_the_choice_is_an_error_and_keeps_no_partial_text(api):
     assert len(api.requests[1].body["messages"]) == 2
 
 
+# ---- Cut-off replies ----
+
+def cut_off_reply(**message):
+    return httpx2.Response(200, json={"choices": [{"finish_reason": "length", "message": {"role": "assistant", **message}}]})
+
+
+def test_a_cut_off_tool_call_tells_the_model_what_happened(api):
+    api.replies = [cut_off_reply(tool_calls=[api_call(name="write_file", arguments='{"path": "app/main.py", "content": "def')])]
+    chat = groq_chat()
+
+    reply = chat.record(chat.send("groq/test-model"))
+
+    assert reply.cut_off is True
+    assert "cut off" in reply.calls[0].error and "smaller" in reply.calls[0].error
+
+
+def test_a_complete_call_in_a_cut_off_reply_can_still_run(api):
+    api.replies = [cut_off_reply(tool_calls=[api_call("first"), api_call("second", arguments='{"path": ')])]
+    chat = groq_chat()
+
+    calls = chat.record(chat.send("groq/test-model")).calls
+
+    assert calls[0].error is None and "cut off" in calls[1].error
+
+
+def test_cut_off_text_is_flagged(api):
+    api.replies = [cut_off_reply(content="I will now write")]
+    chat = groq_chat()
+
+    assert chat.record(chat.send("groq/test-model")).cut_off is True
+
+
+def test_a_normal_reply_is_not_cut_off(api):
+    api.replies = [api_reply("All done.")]
+    chat = groq_chat()
+
+    assert chat.record(chat.send("groq/test-model")).cut_off is False
+
+
+def test_gemini_max_tokens_is_cut_off(gemini):
+    candidate = types.Candidate(content=types.Content(role="model", parts=[types.Part(text="partial")]),
+                                finish_reason=types.FinishReason.MAX_TOKENS)
+    gemini.replies = [types.GenerateContentResponse(candidates=[candidate])]
+    chat = conversation()
+
+    assert chat.record(chat.send("some-model")).cut_off is True
+
+
+def test_an_empty_gemini_turn_never_breaks_the_next_request(gemini):
+    empty = types.GenerateContentResponse(candidates=[types.Candidate(finish_reason=types.FinishReason.MAX_TOKENS)])
+    gemini.replies = [empty, gemini_reply(types.Part(text="ok"))]
+    chat = conversation()
+    reply = chat.record(chat.send("some-model"))
+
+    chat.add_text("Your reply was cut off.")
+    chat.send("some-model")
+
+    assert reply.cut_off is True and reply.calls == []
+    model_turn = gemini.requests[1].contents[1]
+    assert model_turn.role == "model" and model_turn.parts
+
+
+def test_a_gemini_reply_with_no_candidates_is_a_retryable_failure(gemini):
+    gemini.replies = [types.GenerateContentResponse(candidates=[]), gemini_reply(types.Part(text="ok"))]
+    chat = conversation()
+
+    with pytest.raises(RuntimeError, match="no reply"):
+        chat.send("some-model")
+    chat.record(chat.send("some-model"))
+
+    assert len(gemini.requests[1].contents) == 1
+
+
+# ---- Reading provider errors ----
+
+class GeminiStyleError(Exception):
+    code = 503
+    status = "UNAVAILABLE"
+    details = {"error": {"details": [{"retryDelay": "35784s"}]}}
+
+
+@pytest.mark.parametrize("error, status", [
+    (RuntimeError("503 UNAVAILABLE"), 503),
+    (RuntimeError("429 RESOURCE_EXHAUSTED. Quota"), 429),
+    (RuntimeError("quota RESOURCE_EXHAUSTED"), 429),
+    (RuntimeError("500 from openrouter: request id 84291"), 500),
+    (RuntimeError("connection reset"), None),
+    (model_client.ProviderError(413, "from groq: too large"), 413),
+    (GeminiStyleError("whatever"), 503),
+])
+def test_the_status_is_read_from_the_error(error, status):
+    assert model_client.error_status(error) == status
+
+
+def test_retry_after_is_read_from_the_response(api):
+    api.replies = [httpx2.Response(429, headers={"Retry-After": "7"}, text="slow down")]
+    chat = groq_chat()
+
+    with pytest.raises(model_client.ProviderError) as error:
+        chat.send("groq/test-model")
+
+    assert error.value.status == 429 and error.value.retry_after == 7
+
+
+def test_an_unreadable_retry_after_is_ignored(api):
+    api.replies = [httpx2.Response(429, headers={"Retry-After": "Wed, 21 Oct 2026"}, text="slow down")]
+    chat = groq_chat()
+
+    with pytest.raises(model_client.ProviderError) as error:
+        chat.send("groq/test-model")
+
+    assert error.value.retry_after is None
+
+
+def test_geminis_retry_delay_is_read():
+    assert model_client.retry_delay(GeminiStyleError("x")) == 35784
+    assert model_client.retry_delay(RuntimeError("x")) is None
+
+
+def test_an_error_inside_a_200_keeps_its_real_status(api):
+    api.replies = [httpx2.Response(200, json={"error": {"code": 429, "message": "busy"}})]
+    chat = groq_chat()
+
+    with pytest.raises(model_client.ProviderError) as error:
+        chat.send("groq/test-model")
+
+    assert error.value.status == 429
+
+
+@pytest.mark.parametrize("error, permanent", [
+    (model_client.ProviderError(400, "x"), True),
+    (model_client.ProviderError(401, "x"), True),
+    (model_client.ProviderError(402, "x"), True),
+    (model_client.ProviderError(402, "x", retry_after=3), False),
+    (model_client.ProviderError(403, "x"), True),
+    (model_client.ProviderError(404, "x"), True),
+    (model_client.ProviderError(413, "x"), True),
+    (model_client.ProviderError(422, "x"), True),
+    (model_client.ProviderError(408, "x"), False),
+    (model_client.ProviderError(429, "x"), False),
+    (model_client.ProviderError(500, "x"), False),
+    (model_client.ProviderError(503, "x"), False),
+    (RuntimeError("connection reset"), False),
+])
+def test_permanent_errors_are_recognized(error, permanent):
+    assert model_client.is_permanent(error) is permanent
+
+
 # ---- Token and cost tracking ----
 
 def test_gemini_usage_is_read_including_thinking_tokens(gemini):

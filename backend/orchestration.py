@@ -149,6 +149,7 @@ def run_agent_pipeline(project_id: UUID, session_factory, with_tester: bool = Fa
     workspace_root = Path(tempfile.mkdtemp(prefix="agent-"))
     holding_slot = False
     executor = None
+    meter = None
 
     try:
         project = db.get(Project, project_id)
@@ -168,7 +169,7 @@ def run_agent_pipeline(project_id: UUID, session_factory, with_tester: bool = Fa
         workspace = workspace_root / "workspace"  # only used by the local executor
         model = agent.model_for(project.optimization)  # Fastest / Balanced / Best Quality -> cheap / medium / strong
         tester = None
-        meter = agent.model_client.UsageMeter()  # tokens and cost across every agent in this project
+        meter = agent.model_client.UsageMeter.for_project()  # tokens, cost and spending limit across every agent
         executor = make_executor(workspace)
         # Team mode: the database starter, and the tester writes its own tests. Otherwise: the todo app + its tests.
         agent.seed_workspace(executor, include_tests=not with_tester,
@@ -200,7 +201,8 @@ def run_agent_pipeline(project_id: UUID, session_factory, with_tester: bool = Fa
 
         if with_tester:
             tester = agent.run_agent(workspace, on_step=make_saver("Tester · ", tester=True), role="tester",
-                                     start_message=agent.tester_message(project.description), max_steps=12,
+                                     start_message=agent.tester_message(project.description),
+                                     max_steps=agent.tester_steps(project.description),
                                      model=model, executor=executor, meter=meter)
             if not tester["passed"]:
                 project.tasks.append(Task(
@@ -224,7 +226,8 @@ def run_agent_pipeline(project_id: UUID, session_factory, with_tester: bool = Fa
 
         saved_tests = agent.save_tests(executor)  # our own copy, taken before any generated app code has run
         outcome = agent.run_agent(workspace, on_step=make_saver("Builder · " if with_tester else ""),
-                                  max_steps=25 if with_tester else 15, model=model, executor=executor,
+                                  max_steps=agent.builder_steps(agent.count_test_functions(saved_tests))
+                                  if with_tester else 15, model=model, executor=executor,
                                   system_prompt=agent.BUILDER_DB_PROMPT if with_tester else None,
                                   reviewable=with_tester, meter=meter)
 
@@ -269,10 +272,10 @@ def run_agent_pipeline(project_id: UUID, session_factory, with_tester: bool = Fa
         _touch(project)
         db.commit()
         
-    except Exception:
+    except Exception as error:
         logger.exception("Agent pipeline failed for project %s", project_id)
         db.rollback()
-        _mark_failed(db, project_id)
+        _mark_failed(db, project_id, error, executor, meter)
     finally:
         if executor is not None:
             try:
@@ -412,11 +415,37 @@ def _touch(project: Project) -> None:
     project.updated_at = datetime.now(timezone.utc)
 
 
-def _mark_failed(db, project_id: UUID) -> None:
+def _public_reason(error: Exception) -> str:
+    """Why a build stopped, safe to show anyone: a raw exception can contain keys or internal details."""
+    if isinstance(error, agent.model_client.ModelUnavailable):
+        return error.public
+    return "An internal error stopped the build."
+
+
+def _mark_failed(db, project_id: UUID, error: Exception | None = None, executor=None, meter=None) -> None:
+    """Mark a project failed. With `error` (an agent run that crashed), also say why and save what was built so far."""
     try:
         project = db.get(Project, project_id)
         if project is not None:
             project.status = "failed"
+            if error is not None:
+                reason = _public_reason(error)
+                project.tasks.append(Task(
+                    id=uuid4(), position=len(project.tasks) + 1, name=f"Build stopped: {reason}"[:200],
+                    description="The run ended early", tool="orchestrator", status="failed", attempts=1,
+                ))
+                if meter is not None:
+                    _save_usage(project, meter)
+                files = None
+                if executor is not None:
+                    try:
+                        files = _collect_files(executor)
+                    except Exception:  # the sandbox may be gone: still record the failure honestly
+                        logger.exception("Could not save partial files for project %s", project_id)
+                if files:
+                    project.artifact = files
+                project.summary = f"The build stopped. {reason}" + (
+                    " The files written so far are in the download." if files else "")
             _touch(project)
             db.commit()
     except Exception:
