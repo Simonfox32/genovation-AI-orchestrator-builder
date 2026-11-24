@@ -52,10 +52,14 @@ CUT_OFF_MESSAGE = ("Your last reply was cut off because it was too long. Continu
 
 # The dashboard's Optimization setting -> which Gemini model the agents use.
 MODELS_BY_OPTIMIZATION = {"speed": CHEAP_MODEL, "balanced": MEDIUM_MODEL, "quality": STRONG_MODEL}
+OPENROUTER_MODEL = "openrouter/openai/gpt-6-luna@openai"  # tested end to end through the project pipeline
 
 
 def model_for(optimization):
-    """The model for an optimization setting ('speed', 'balanced', 'quality'); unknown settings get the default."""
+    """The model for an optimization setting ('speed', 'balanced', 'quality'); unknown settings get the default.
+    With OPEN_ROUTER_API_KEY set, every setting uses one low-cost OpenRouter model (AGENT_MODEL can change it)."""
+    if os.getenv("OPEN_ROUTER_API_KEY"):
+        return os.getenv("AGENT_MODEL") or OPENROUTER_MODEL
     return MODELS_BY_OPTIMIZATION.get(optimization, MODEL)
 
 

@@ -673,3 +673,16 @@ def test_database_template_readme_commands_are_safe_to_paste():
     for command in commands:
         assert len(command.strip().splitlines()) == 1, command
         assert "#" not in command, command
+
+
+def test_an_openrouter_key_sends_every_setting_to_one_low_cost_model(monkeypatch):
+    monkeypatch.setenv("OPEN_ROUTER_API_KEY", "fake")
+    monkeypatch.delenv("AGENT_MODEL", raising=False)
+
+    assert {agent.model_for(setting) for setting in ("speed", "balanced", "quality")} == {agent.OPENROUTER_MODEL}
+
+    monkeypatch.setenv("AGENT_MODEL", "openrouter/deepseek/some-model")
+    assert agent.model_for("quality") == "openrouter/deepseek/some-model"
+
+    monkeypatch.delenv("OPEN_ROUTER_API_KEY")
+    assert agent.model_for("quality") == agent.STRONG_MODEL
