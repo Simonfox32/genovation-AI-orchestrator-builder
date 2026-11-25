@@ -320,7 +320,7 @@ def fake_sandbox(monkeypatch):
 def test_executor_setting_picks_where_code_runs(monkeypatch, tmp_path, fake_sandbox):
     assert isinstance(orchestration.make_executor(tmp_path), FakeSandbox)
 
-    monkeypatch.delenv("EXECUTOR")
+    monkeypatch.setenv("EXECUTOR", "local")
 
     assert isinstance(orchestration.make_executor(tmp_path), orchestration.LocalExecutor)
 

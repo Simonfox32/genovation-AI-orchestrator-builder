@@ -57,10 +57,25 @@ class RateLimiter:
 project_creation_limiter = RateLimiter(limit=int(os.getenv("RATE_LIMIT_PER_MINUTE", "10")))
 
 
+def client_address(request: Request) -> str:
+    """Who is asking, for the rate limit.
+
+    Railway's edge sets X-Real-IP to the caller's address. X-Forwarded-For can't be used: anyone can send their own,
+    and with --forwarded-allow-ips="*" uvicorn takes its first entry as the client (Nov 23 audit: 15 of 15 requests
+    with made-up addresses got past a limit of 10). Set CLIENT_IP_HEADER to another header for a different host,
+    or to an empty value to use the connection's address.
+    """
+    header = os.getenv("CLIENT_IP_HEADER", "X-Real-IP")
+    if header:
+        value = request.headers.get(header, "").strip()
+        if value:
+            return value
+    return request.client.host if request.client else "unknown"
+
+
 def limit_project_creation(request: Request) -> None:
     """Each new project triggers AI work, so cap how often one client can create them."""
-    client = request.client.host if request.client else "unknown"
-    if not project_creation_limiter.allow(client):
+    if not project_creation_limiter.allow(client_address(request)):
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Too many projects created; try again in a minute"
