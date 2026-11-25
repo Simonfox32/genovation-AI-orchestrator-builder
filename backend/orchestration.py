@@ -120,15 +120,28 @@ def run_pipeline(project_id: UUID, session_factory) -> None:
         db.close()
 
 
+class BuildRefused(RuntimeError):
+    """A build this server must not run. `public` is safe to show users."""
+
+    def __init__(self, public: str):
+        super().__init__(public)
+        self.public = public
+
+
 def make_executor(workspace: Path):
     """WHERE the agents' code runs, picked by EXECUTOR.
 
     "vercel": a Vercel Sandbox microVM with no secrets and no network. The only safe choice on a public server.
-    anything else: this machine. Fine for local development and tests, but NOT a sandbox.
+    "local": this machine. Fine for local development and tests, but NOT a sandbox.
+    anything else, including unset: refused, so a missing or mistyped setting can never run code on the server.
     """
-    if os.getenv("EXECUTOR") == "vercel":
+    choice = os.getenv("EXECUTOR")
+    if choice == "vercel":
         return SandboxExecutor()
-    return LocalExecutor(workspace)
+    if choice == "local":  # this machine, for development: must be chosen on purpose
+        return LocalExecutor(workspace)
+    # Fail closed: a missing or mistyped setting must never mean "run AI-written code on the server".
+    raise BuildRefused("This server isn't set up to run builds safely: EXECUTOR must be vercel.")
 
 
 def run_agent_pipeline(project_id: UUID, session_factory, with_tester: bool = False) -> None:
@@ -417,7 +430,7 @@ def _touch(project: Project) -> None:
 
 def _public_reason(error: Exception) -> str:
     """Why a build stopped, safe to show anyone: a raw exception can contain keys or internal details."""
-    if isinstance(error, agent.model_client.ModelUnavailable):
+    if isinstance(error, (agent.model_client.ModelUnavailable, BuildRefused)):
         return error.public
     return "An internal error stopped the build."
 

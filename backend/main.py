@@ -2,13 +2,14 @@ import io
 import os
 import posixpath
 import zipfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Annotated
 from uuid import UUID, uuid4
 
 from models import Project
 
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Depends, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -104,6 +105,16 @@ class ProjectResponse(BaseModel):
 
 NOT_FOUND = {404: {"description": "Project not found"}}
 
+# Builds run one at a time, and each waiting build occupies a server thread. Past this many, new requests are turned
+# away instead of piling up until the server stops answering. A build not updated for STALE_AFTER (say, stranded by a
+# restart) doesn't count.
+DEFAULT_MAX_ACTIVE_BUILDS = 20
+STALE_AFTER = timedelta(minutes=30)
+
+
+def max_active_builds() -> int:
+    return int(os.getenv("MAX_ACTIVE_BUILDS", DEFAULT_MAX_ACTIVE_BUILDS))
+
 
 @app.get("/")
 def read_root():
@@ -125,6 +136,10 @@ def create_project(
 ):
     project_id = uuid4()
     now = datetime.now(timezone.utc)
+    active = db.scalar(select(func.count()).select_from(Project).where(
+        Project.status.in_(("pending", "running")), Project.updated_at > now - STALE_AFTER))
+    if active >= max_active_builds():
+        raise HTTPException(status_code=503, detail="The builder is busy. Try again in a few minutes.")
 
     new_project = Project(
         id = project_id,
@@ -137,10 +152,14 @@ def create_project(
 
     db.add(new_project)
     db.commit()
+    # Build the response and close this session now. FastAPI only closes it after the background work below finishes,
+    # so every queued or running build used to keep a database connection (at 15, the dashboard froze).
+    response = ProjectResponse.model_validate(new_project, from_attributes=True)
+    db.close()
 
     # Runs after the 201 response is sent, so the client gets the id immediately and polls GET for progress.
-    background_tasks.add_task(pipeline, new_project.id, session_factory)
-    return new_project
+    background_tasks.add_task(pipeline, project_id, session_factory)
+    return response
 
 
 @app.get("/projects/{project_id}", response_model=ProjectResponse, responses=NOT_FOUND)

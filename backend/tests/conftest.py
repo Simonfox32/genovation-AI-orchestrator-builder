@@ -21,7 +21,9 @@ for provider_key in ("GEMINI_API_KEY", "OPENAI_API_KEY", "GROQ_API_KEY", "OPEN_R
     os.environ.pop(provider_key, None)
 os.environ.pop("ROUTER_TOOLS", None)
 
-os.environ.pop("ORCHESTRATOR", None)  
+os.environ.pop("ORCHESTRATOR", None)
+# Tests run the agents' code on this machine on purpose. Servers must choose EXECUTOR explicitly.
+os.environ["EXECUTOR"] = "local"
 
 TEST_DATABASE_URL = os.environ["TEST_DATABASE_URL"]
 
